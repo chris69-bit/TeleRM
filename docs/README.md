@@ -3,6 +3,7 @@
 | Assignment | Milestone | Topic | Design report | Git tag |
 | --- | --- | --- | --- | --- |
 | 1 | M1 | Distributed OS foundation | [M1.md](assignment1/M1.md) | m1 |
+| 1 | M2 | Distributed processing and performance | [M2.md](assignment1/M2.md) | m2, a1 |
 
 Each `docs/assignmentN/` folder holds that assignment's design reports, architecture diagrams and PDFs. Results for every milestone are in `results/` (folders named M1-..., M2-..., M3-..., M4..., M5/, M6/).
 

@@ -1,10 +1,18 @@
 """Inter-node communication: length-prefixed JSON messages over TCP.
 
 Every message is  [4-byte big-endian length][UTF-8 JSON body].
-Every exchange is one request -> one reply on a fresh TCP connection.
-This is deliberately simple for Milestone 1; Milestone 11 replaces it with RPC.
+
+Two ways to talk (S2):
+  call()   - control plane. Open a connection, send one request, read one reply, close.
+             Used for REGISTER, HEARTBEAT, REQUEST, ALLOCATE ... (low rate).
+  Channel  - data plane. One long-lived connection that carries many requests at once.
+             Each request carries an id ("rid"); the reply echoes it so answers that come
+             back in a different order still reach the right caller. Used for TASK traffic.
+
+Servers accept both: a connection may carry one message or many.
 """
 import asyncio
+import itertools
 import json
 import struct
 import time
@@ -12,12 +20,18 @@ import time
 _HDR = struct.Struct("!I")
 MAX_MSG_BYTES = 4 * 1024 * 1024
 
-# Per-process communication counters (used for overhead analysis in Week 2).
-STATS = {"msgs_sent": 0, "bytes_sent": 0, "msgs_recv": 0, "bytes_recv": 0, "call_errors": 0}
+# Per-process communication counters (communication-overhead analysis).
+STATS = {"msgs_sent": 0, "bytes_sent": 0, "msgs_recv": 0, "bytes_recv": 0,
+         "call_errors": 0, "connections_opened": 0}
 
 
 def now() -> float:
     return time.time()
+
+
+def mono() -> float:
+    """Monotonic clock for measuring durations on one machine (never jumps backwards)."""
+    return time.perf_counter()
 
 
 async def send_msg(writer: asyncio.StreamWriter, msg: dict) -> None:
@@ -39,9 +53,10 @@ async def recv_msg(reader: asyncio.StreamReader) -> dict:
 
 
 async def call(host: str, port: int, msg: dict, timeout: float = 5.0) -> dict:
-    """Send one request to a node and wait for its reply."""
+    """Control plane: send one request on a fresh connection and wait for its reply."""
     try:
         reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+        STATS["connections_opened"] += 1
     except Exception:
         STATS["call_errors"] += 1
         raise
@@ -59,20 +74,95 @@ async def call(host: str, port: int, msg: dict, timeout: float = 5.0) -> dict:
             pass
 
 
-def make_server_callback(handler):
-    """Wrap `async handler(msg) -> reply` as an asyncio stream-server callback."""
-    async def _callback(reader, writer):
+class Channel:
+    """Data plane: one persistent connection, many requests in flight at once."""
+
+    def __init__(self, host: str, port: int):
+        self.host, self.port = host, port
+        self.reader = self.writer = None
+        self.pending: dict[int, asyncio.Future] = {}
+        self.ids = itertools.count(1)
+        self.lock = asyncio.Lock()
+        self.reader_task = None
+
+    async def connect(self, timeout: float = 5.0):
+        self.reader, self.writer = await asyncio.wait_for(asyncio.open_connection(self.host, self.port), timeout)
+        STATS["connections_opened"] += 1
+        self.reader_task = asyncio.create_task(self._read_loop())
+
+    async def _read_loop(self):
         try:
-            msg = await recv_msg(reader)
-            reply = await handler(msg)
-            await send_msg(writer, reply if reply is not None else {"ok": True})
-        except (asyncio.IncompleteReadError, ConnectionError):
-            pass
-        except Exception as exc:  # never let one bad message kill the node
+            while True:
+                msg = await recv_msg(self.reader)
+                fut = self.pending.pop(msg.get("rid"), None)
+                if fut is not None and not fut.done():
+                    fut.set_result(msg)
+        except Exception as exc:                       # connection closed or broken
+            for fut in self.pending.values():
+                if not fut.done():
+                    fut.set_exception(ConnectionError(f"channel closed: {exc!r}"))
+            self.pending.clear()
+
+    async def request(self, msg: dict, timeout: float = 5.0) -> dict:
+        rid = next(self.ids)
+        fut = asyncio.get_running_loop().create_future()
+        self.pending[rid] = fut
+        async with self.lock:                          # one writer at a time on the socket
+            await send_msg(self.writer, {**msg, "rid": rid})
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        finally:
+            self.pending.pop(rid, None)
+
+    async def close(self):
+        if self.reader_task:
+            self.reader_task.cancel()
+        if self.writer:
+            self.writer.close()
             try:
-                await send_msg(writer, {"ok": False, "error": repr(exc)})
+                await self.writer.wait_closed()
             except Exception:
                 pass
+
+
+def make_server_callback(handler):
+    """Wrap `async handler(msg) -> reply` as an asyncio stream-server callback.
+
+    Reads messages until the client closes the connection. Each message is handled in its
+    own task, so a slow request (e.g. a TASK waiting in a queue) does not hold up others on
+    the same connection. Replies echo the request's "rid".
+    """
+    async def _callback(reader, writer):
+        lock = asyncio.Lock()
+        inflight = set()
+
+        async def _serve(msg):
+            try:
+                reply = await handler(msg)
+                if reply is None:
+                    reply = {"ok": True}
+            except Exception as exc:                   # never let one bad message kill the node
+                reply = {"ok": False, "error": repr(exc)}
+            if "rid" in msg:
+                reply = {**reply, "rid": msg["rid"]}
+            try:
+                async with lock:
+                    await send_msg(writer, reply)
+            except Exception:
+                pass
+
+        try:
+            while True:
+                msg = await recv_msg(reader)
+                t = asyncio.create_task(_serve(msg))
+                inflight.add(t)
+                t.add_done_callback(inflight.discard)
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        except Exception:
+            pass
         finally:
+            if inflight:
+                await asyncio.gather(*inflight, return_exceptions=True)
             writer.close()
     return _callback

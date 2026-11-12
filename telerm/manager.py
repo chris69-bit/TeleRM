@@ -17,6 +17,7 @@ import logging
 import os
 import signal
 
+from .monitor import ResourceMonitor
 from .protocol import STATS, call, make_server_callback, now
 from .resources import (PLACEMENT_POLICIES, NodeResources, Resources, Topology,
                         choose, evaluate_candidates)
@@ -89,6 +90,9 @@ class Manager:
             site = self.sites[site_id]
             inst = {"sid": sid, "service": r["service"], "ingress": r["ingress"],
                     "demand": demand.to_dict(), "holding_s": r["holding_s"]}
+            for k in ("work_kb", "backlogged", "queue_limit"):      # S2 traffic settings, if given
+                if k in r:
+                    inst[k] = r[k]
             try:
                 rep = await call(site["host"], site["port"], {"type": "ALLOCATE", "instance": inst}, timeout=3.0)
                 if not rep.get("ok"):
@@ -111,6 +115,7 @@ class Manager:
             self.event("accepted", sid=sid, service=r["service"], ingress=r["ingress"], site=site_id,
                        path=path, latency_ms=lat)
             return {"ok": True, "sid": sid, "status": "ACCEPTED", "site": site_id, "path": path,
+                    "address": f"{site['host']}:{site['port']}",   # S2: where to send its traffic
                     "latency_ms": lat, "decision_ms": round(decision_ms, 3)}
 
     async def resize(self, sid: str, new_cpu: float) -> dict:
@@ -171,6 +176,7 @@ class Manager:
             s["last_hb"] = now()
             s["slot_utilisation"] = msg.get("slot_utilisation", 0.0)
             s["fairness"] = msg.get("fairness")
+            s["resources"] = msg.get("resources")
             for rep in msg.get("instances", []):
                 if rep["sid"] in self.alloc:
                     self.alloc[rep["sid"]]["last_report"] = rep
@@ -203,14 +209,17 @@ class Manager:
             await asyncio.sleep(0.5)
 
     async def sampler(self):
-        """Utilisation time series (1 s), used for resource-utilisation analysis."""
+        """Utilisation time series (1 s): reservations (S1) plus measured CPU/memory (S2)."""
+        monitor = ResourceMonitor()
         while not self.shutdown.is_set():
             await asyncio.sleep(1.0)
             self.timeseries.append({
-                "t": round(now() - self.started, 2),
+                "t": round(now() - self.started, 2), "wall": round(now(), 3),
                 "active": sum(1 for a in self.alloc.values() if a["state"] == "ACTIVE"),
+                "manager": monitor.sample(),
                 "sites": {sid: {**{k: round(v, 4) for k, v in s["res"].utilisation().items()},
-                                "slot_util": s["slot_utilisation"]} for sid, s in self.sites.items()},
+                                "slot_util": s["slot_utilisation"], "measured": s.get("resources")}
+                          for sid, s in self.sites.items()},
                 "links": self.topo.utilisation()})
 
     def status(self, full=False):

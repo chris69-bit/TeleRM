@@ -1,16 +1,44 @@
-# TeleRM – Distributed Telecom Resource Management System (S1)
+# TeleRM – Distributed Telecom Resource Management System (S2)
 
-ICS 2403 Theme 3 · Milestone 1: Distributed OS Foundation.
-Design, process model, resource model and justification
+ICS 2403 Theme 3.
+- Milestone 1 (S1, Distributed OS Foundation): **docs/assignment1/M1.md**, `TeleRM_S1_Architecture.png`
+- Milestone 2 (S2, Distributed Processing and Performance): **docs/assignment1/M2.md** (also as PDF),
+  `TeleRM_S2_Architecture.png`, results in `results/M2-load-sweep/`
 
 ## Requirements
-Python 3.10 or newer.
+Python 3.10 or newer, on Linux, macOS or Windows.
+```bash
+pip install -r requirements.txt      # psutil (CPU/memory measurement), matplotlib (charts)
+```
+The S1 demo still runs without any packages; without psutil the CPU/memory columns are empty.
 
-## Quick start
+## Milestone 2: performance experiment
+```bash
+python -m experiments.perf_experiment                  # full sweep: 2 policies x 7 loads x 3 repetitions (~20 min)
+python -m analysis.analyze results/<folder>         # charts + summary.md (tables)
+```
+Quick single run (about 30 s):
+```bash
+python -m experiments.perf_experiment --policies edge_first --loads 300 --reps 1 --measure 10
+```
+Each run starts all nodes fresh, admits 10 service instances through the manager, then
+sends seeded Poisson traffic tasks straight to the sites and measures throughput, latency,
+jitter, packet loss, CPU and memory. Settings live in the `perf` section of `configs/config.json`.
+
+> Set `offered_loads` for your machine. A good range runs from well below to just above
+> the load where loss starts. On a 2-core machine that point is about 500 tasks/s.
+> Close other heavy programs while measuring.
+
+**Several machines (recommended for real distributed results):** start the manager and
+the sites as shown in "Running across several machines" below, put the LAN addresses in
+`configs/config.json`, then run `python -m experiments.perf_experiment --no-launch --policies edge_first`
+(the policy is the one the manager was started with).
+
+## Milestone 1: admission demo (all nodes on one machine)
 ```bash
 python -m experiments.run_demo
 ```
-This starts the resource manager and three sites `edge-A`, `edge-B`, `core-1` as separate
+This starts the resource manager and three sites (`edge-A`, `edge-B`, `core-1`) as separate
 OS processes. It then replays a seeded Poisson stream of telecom service requests:
 
 - about 52 requests of vRAN-DU, UPF, IMS-CSCF, Transcoder and IoT-GW over 30 s
@@ -21,15 +49,15 @@ of CPU enforcement, and per-instance throughput. Results are saved to `results/<
 
 Useful variations:
 ```bash
-python -m experiments.run_demo --policy least_loaded  
-python -m experiments.run_demo --rate 3 --window 40     
+python -m experiments.run_demo --policy least_loaded      # edge_first | least_loaded | best_fit
+python -m experiments.run_demo --rate 3 --window 40       # heavier load, longer run
 ```
 To change site capacities, links, the service catalogue, the workload or the seed, edit
 `configs/config.json`.
 
-Every running instance is kept busy, so the worker processes use all the CPU they get
-while instances are active. On a small machine, reduce `job_work_kb` or the site `slots`
-in `configs/config.json`.
+> Every running instance is kept busy, so the worker processes use all the CPU they get
+> while instances are active. On a small machine, reduce `job_work_kb` or the site `slots`
+> in `configs/config.json`.
 
 ## Running across several machines
 Manager machine:
@@ -51,18 +79,34 @@ Open ports 8000 and 8101–8103 in each machine's firewall.
 ## Project layout
 ```
 telerm/
-  protocol.py   length-prefixed JSON over TCP, message/byte counters
+  protocol.py   length-prefixed JSON over TCP; call() for control, Channel for traffic (S2)
   resources.py  node resource vector, topology, link reservations, admission checks, placement
   process.py    service-instance record and enforced state machine
-  scheduler.py  stride scheduler (proportional share of CPU = allocation)
-  site.py       site node: ALLOCATE/RESIZE/RELEASE, worker pool, heartbeats, fairness
+  scheduler.py  stride scheduler (proportional share of CPU = allocation; work-conserving in S2)
+  site.py       site node: ALLOCATE/RESIZE/RELEASE, TASK queues (S2), worker pool, heartbeats
   manager.py    global resource manager: registry, admission, placement, allocation table
-experiments/run_demo.py     launches all nodes, replays the workload, reports, saves results
-configs/config.json     sites, links, service catalogue, workload, seed
-docs/assignment1/M1.md       Milestone 1 design document and Week 1 failure log
+  monitor.py    S2: measures real CPU % and memory of a node (psutil)
+experiments/run_demo.py         S1: launches all nodes, replays the admission workload, reports
+experiments/perf_experiment.py  S2: traffic generator + meter, runs the load sweep
+analysis/analyze.py          S2: charts and tables from runs.csv
+configs/config.json         sites, links, services, S1 workload, S2 `perf` experiment, seed
+docs/assignment1/M1.md           Milestone 1 design document and Week 1 failure log
+docs/assignment1/M2.md        Milestone 2 report and Week 2 failure log
 ```
 
 ## Output files
+Milestone 2 (`results/<folder>/`):
+
+| File | Contents |
+|---|---|
+| `config_used.json` | Exact config plus hardware, OS, Python and psutil versions |
+| `runs.csv` | One row per run: every metric, per site |
+| `<policy>_<load>_r<rep>/tasks.csv` | Every task: send/receive time, status, queue/processing/communication time |
+| `<policy>_<load>_r<rep>/run.json` | Placement of each instance, 1 s resource time series |
+| `charts/`, `summary.md` | Produced by `analysis/analyze.py` |
+
+Milestone 1 (`experiments/run_demo.py`):
+
 | File | Contents |
 |---|---|
 | `config_used.json` | Exact config, Python version, platform |
