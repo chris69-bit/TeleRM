@@ -6,6 +6,7 @@
 | 1 | M2 | Distributed processing and performance | [M2.md](assignment1/M2.md) | m2, a1 |
 | 2 | M3 | Distributed architecture (edge, core, cloud microservices) | [M3.md](assignment2/M3.md) | m3 |
 | 2 | M4 | Distributed algorithms and coordination (Raft, Lamport clocks) | [M4.md](assignment2/M4.md) | m4, a2 |
+| 3 | M5 | Distributed transactions (2PC, 3PC) | [M5.md](assignment3/M5.md) | m5 |
 
 Each `docs/assignmentN/` folder holds that assignment's design reports, architecture diagrams and PDFs. Results for every milestone are in `results/` (folders named M1-..., M2-..., M3-..., M4..., M5/, M6/).
 

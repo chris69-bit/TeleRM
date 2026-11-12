@@ -17,7 +17,7 @@ Link delay: all nodes usually run on one machine, where the real network delay i
 almost zero. The configured link latency (e.g. edge-A -> core-1 = 5 ms one way) is added
 to every task's measured time as 2 x one-way delay. This is a model, stated as such.
 
-    python -m experiments.perf_experiment                         # full sweep from config.json
+    python -m experiments.perf_experiment                         # full sweep from configs/config.json
     python -m experiments.perf_experiment --policies edge_first --loads 200 --measure 10   # one quick run
     python analyze.py results/<folder>                # charts and tables
 """
@@ -284,7 +284,7 @@ async def one_run(cfg, policy, rate, rep, out_dir, no_launch=False):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=os.path.join(ROOT, "config.json"))
+    ap.add_argument("--config", default=os.path.join(ROOT, "configs/config.json"))
     ap.add_argument("--policies", nargs="+")
     ap.add_argument("--loads", nargs="+", type=int)
     ap.add_argument("--reps", type=int)

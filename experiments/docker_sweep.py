@@ -4,7 +4,7 @@
     python -m experiments.docker_sweep scaleout  --sizes 1 2 3 4 --reps 3
 
 tiers     edge vs core vs cloud: placement policies edge_first / least_loaded / tier_aware,
-          sites with CPU quotas from config.json (s3.docker.cpus), link delay emulated by gateways
+          sites with CPU quotas from configs/config.json (s3.docker.cpus), link delay emulated by gateways
 scaleout  horizontal scalability of the compute tier: 1..4 identical sites (same CPU quota),
           offered load above capacity, so throughput = what the sites can process
 
@@ -43,7 +43,7 @@ def run_one(compose_file, env, loadgen_args):
     sh(base + ["down", "--remove-orphans"], env, check=False, quiet=True)
     sh(base + ["up", "-d"], env, quiet=True)
     try:
-        sh(base + ["run", "--rm", "loadgen", "python", "m3_run.py", "traffic", "--arch", "s3", "--deploy", "external",
+        sh(base + ["run", "--rm", "loadgen", "python", "-m", "experiments.m3_run", "traffic", "--arch", "s3", "--deploy", "external",
                    "--registry", "registry:8010"] + loadgen_args, env)
     finally:
         sh(base + ["down", "--remove-orphans"], env, check=False, quiet=True)
@@ -62,7 +62,7 @@ def main():
     ap.add_argument("--deadline-ms", type=float, default=1000.0, help="0 = sites never discard late tasks")
     ap.add_argument("--out", default=None)
     a = ap.parse_args()
-    cfg = json.load(open(os.path.join(ROOT, "config.json")))
+    cfg = json.load(open(os.path.join(ROOT, "configs/config.json")))
     env = {"BASE_IMAGE": os.environ.get("BASE_IMAGE", "python:3.12-slim")}
     out_rel = a.out or f"results/M3-{a.experiment}"
     os.makedirs(os.path.join(ROOT, out_rel), exist_ok=True)

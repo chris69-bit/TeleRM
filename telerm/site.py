@@ -28,6 +28,7 @@ from .process import Instance, State, Task
 from .protocol import STATS, call, make_server_callback, mono, now, log_event
 from .resources import Resources
 from .scheduler import StrideScheduler
+from .txn import Participant
 
 log = logging.getLogger("site")
 
@@ -74,6 +75,23 @@ class Site:
                          "tasks_expired": 0}
         self.shutdown = asyncio.Event()
         self.started = now()
+        # S5: the site is a transaction participant (ledger + write-ahead log + in-doubt resolver)
+        self.part = Participant(self.id, self.capacity, a.wal_dir, fsync=a.fsync, indoubt_s=a.indoubt_s,
+                                coord_call=self._coord_call, start_instance=self._txn_start,
+                                notify_exit=self._txn_notify)
+
+    async def _coord_call(self, msg):
+        return await self.reg.call_service("orchestrator", msg, timeout=1.0, retry_s=0.0)
+
+    async def _txn_notify(self, sid):
+        await self._to_manager({"type": "INSTANCE_EXIT", "site": self.id, "sid": sid})
+
+    def _txn_start(self, sid, part, remaining):
+        """COMMIT arrived: the instance becomes a running service instance under the stride scheduler."""
+        inst = Instance(sid=sid, service=part["service"], ingress=part["ingress"],
+                        demand=Resources.from_dict(part["demand"]), holding_s=float(remaining),
+                        work_kb=self.work_kb, backlogged=True, queue_limit=64)
+        self.sched.create(inst)
 
     async def run_job(self, inst: Instance, work_kb: int) -> int:
         pid = await asyncio.get_running_loop().run_in_executor(self.pool, process_batch, work_kb)
@@ -81,6 +99,9 @@ class Site:
         return pid
 
     async def on_exit(self, inst: Instance):
+        if inst.sid in self.part.active:                     # S5: a transaction part ends: free the ledger
+            await self.part.exit_instance(inst.sid)
+            return
         await self._to_manager({"type": "INSTANCE_EXIT", "site": self.id, "sid": inst.sid,
                                 "summary": inst.summary()})
 
@@ -117,6 +138,8 @@ class Site:
     # ---------------------------------------------------------------- control plane
     async def handle(self, msg):
         t = msg.get("type")
+        if t in ("PREPARE", "PRECOMMIT", "COMMIT", "ABORT", "TXN_STATE", "DIRECT", "DIRECT_UNDO", "FAULT"):
+            return await self.part.handle(msg)                # S5 transaction messages
         if t == "TASK":
             return await self.handle_task(msg)
         if t == "ALLOCATE":
@@ -150,7 +173,9 @@ class Site:
 
     def status(self):
         fs = [f for f in self.fairness_samples if f is not None]
-        return {"site": self.id, "pid": os.getpid(), "uptime_s": round(now() - self.started, 2),
+        part = self.part.status()                           # S5: transaction states, ledger, WAL statistics
+        return {**{k: v for k, v in part.items() if k not in ("site", "stats")}, "txn_stats": part["stats"],
+                "stats": part["stats"], "site": self.id, "pid": os.getpid(), "uptime_s": round(now() - self.started, 2),
                 "scheduler": self.sched.snapshot(), "worker_pids": sorted(self.worker_pids),
                 "fairness_mean": round(sum(fs) / len(fs), 4) if fs else None, "fairness_samples": len(fs),
                 "counters": dict(self.counters), "resources": self.resource_samples[-600:],
@@ -224,7 +249,9 @@ class Site:
         self.monitor = ResourceMonitor()                 # after the workers exist
         server = await asyncio.start_server(make_server_callback(self.handle), self.bind, self.port)
         await self.register()
-        tasks = [asyncio.create_task(self.sched.run()), asyncio.create_task(self.heartbeat_loop())]
+        await self.part.restart_instances()
+        tasks = [asyncio.create_task(self.sched.run()), asyncio.create_task(self.heartbeat_loop()),
+                 asyncio.create_task(self.part.resolver_loop())]
         await self.shutdown.wait()
         self.sched.stop()
         server.close()
@@ -249,6 +276,9 @@ def main(argv=None):
     ap.add_argument("--heartbeat", type=float, default=1.0)
     ap.add_argument("--registry", default=None, help="S3: registry address (replaces --manager)")
     ap.add_argument("--location", default=None, help="S3: topology node of this site (default: --id)")
+    ap.add_argument("--wal-dir", default="results/wal", help="S5: write-ahead log directory")
+    ap.add_argument("--fsync", action="store_true", help="S5: fsync every WAL record")
+    ap.add_argument("--indoubt-s", type=float, default=2.0, help="S5: ask about a PREPARED txn after this long")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format=f"%(asctime)s [{a.id}] %(name)s: %(message)s")
     site = Site(a)

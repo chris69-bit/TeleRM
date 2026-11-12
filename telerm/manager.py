@@ -34,6 +34,7 @@ from .monitor import ResourceMonitor
 from .naming import RegistryClient
 from .protocol import NODE, STATS, call, log_event, make_server_callback, mono, now
 from .raft import NotLeader, RaftNode
+from .txn import Coordinator, set_fault
 from .resources import (PLACEMENT_POLICIES, NodeResources, Resources, Topology,
                         choose, evaluate_candidates)
 
@@ -86,6 +87,7 @@ class Manager:
                                  heartbeat_ms=a.heartbeat_ms, peer_delay_ms=delays, fsync=a.fsync,
                                  on_role=self.on_role, commit_timeout=a.commit_timeout)
         self.admit_ms: list = []
+        self.txn = Coordinator(self, vote_timeout=a.vote_timeout) if a.raft_id else None     # S5
 
     async def sync_sites(self):
         """S3: refresh the site list from the registry (capacity, address, tier, liveness)."""
@@ -238,6 +240,8 @@ class Manager:
         the same commands in the same order give the same allocation table everywhere."""
         self.sm["applied"] += 1
         op = cmd["op"]
+        if op.startswith("TXN_"):                            # S5: transaction log entries
+            return self.txn.apply(cmd, index)
         if op == "ADMIT":
             site_id = cmd["site"]
             s = self.sites.get(site_id)
@@ -298,7 +302,7 @@ class Manager:
                        if s["res"].allocated.cpu > 1e-9 or s["res"].allocated.mem > 1e-9 or s["res"].allocated.bw > 1e-9)
         # (sites with nothing allocated are skipped: the leader also knows idle sites from the registry)
         links = sorted((k, round(l.allocated, 3)) for k, l in self.topo.links.items())
-        blob = json.dumps([allocs, sites, links, self.sm["seq"]]).encode()
+        blob = json.dumps([allocs, sites, links, self.sm["seq"], self.txn.hash_part() if self.txn else None]).encode()
         return hashlib.sha256(blob).hexdigest()[:16]
 
     async def on_role(self, role, term):
@@ -418,6 +422,13 @@ class Manager:
     async def release_raft(self, sid):
         if not self.raft.is_ready():
             return self.not_leader()
+        if "." in sid:                                       # S5: one part of a transaction ended
+            txn, i = sid.split(".")
+            try:
+                await self.raft.propose({"op": "TXN_PART_EXIT", "txn": txn, "i": int(i)})
+            except NotLeader as exc:
+                return self.not_leader(exc)
+            return {"ok": True}
         log_event("exit_recv", sid=sid)
         a = self.alloc.get(sid)
         if not a or a["state"] != "ACTIVE":
@@ -441,6 +452,18 @@ class Manager:
         t = msg.get("type")
         if self.raft and t.startswith("RAFT_"):
             return self.raft.handle(msg)
+        if self.txn and t == "FAULT":
+            set_fault(msg)
+            return {"ok": True}
+        if self.txn and t == "TXN_REQUEST":
+            if not self.raft.is_ready():
+                return self.not_leader()
+            r = msg["request"]
+            return await (self.txn.request_naive(r) if r.get("proto") == "naive" else self.txn.request(r))
+        if self.txn and t == "TXN_STATUS":
+            if not self.raft.is_ready():
+                return self.not_leader()
+            return await self.txn.status(msg["txn"])
         if self.raft and t == "INSTANCE_EXIT":
             return await self.release_raft(msg["sid"])
         if self.raft and t == "RESIZE":
@@ -558,6 +581,12 @@ class Manager:
             out["state_hash"] = self.state_hash()
             out["state_machine"] = dict(self.sm)
             out["active"] = sum(1 for a in self.alloc.values() if a["state"] == "ACTIVE")
+            out["txn_stats"] = dict(self.txn.stats)
+            out["txns"] = {k: {"state": r["state"], "proto": r["proto"], "done": r["done"],
+                               "sites": sorted({p["site"] for p in r["plan"]}), "released": len(r["released"])}
+                           for k, r in self.txn.sm.items()}
+            out["txn_records"] = self.txn.records[-2000:]
+            out["phase2_ms"] = dict(self.txn.phase2_ms)
             out["admit_ms_mean"] = round(sum(self.admit_ms) / len(self.admit_ms), 3) if self.admit_ms else None
         if full:
             out["timeseries"] = self.timeseries
@@ -580,6 +609,8 @@ class Manager:
         log.info("%s pid %d on %s:%d (placement=%s)", "orchestrator" if self.reg else "resource manager",
                  os.getpid(), self.bind, self.port, self.policy)
         loops = [asyncio.create_task(self.failure_detector()), asyncio.create_task(self.sampler())]
+        if self.txn:
+            loops.append(asyncio.create_task(self.txn.maintenance()))
         await self.shutdown.wait()
         for l in loops:
             l.cancel()
@@ -607,6 +638,7 @@ def main(argv=None):
     ap.add_argument("--heartbeat-ms", type=float, default=50, help="S4: leader heartbeat interval (ms)")
     ap.add_argument("--peer-delay-ms", default="", help="S4: emulated one-way delay to peers, e.g. o2=5,o3=20")
     ap.add_argument("--commit-timeout", type=float, default=3.0)
+    ap.add_argument("--vote-timeout", type=float, default=1.5, help="S5: wait this long for a PREPARE vote")
     ap.add_argument("--fsync", action="store_true", help="S4: fsync the Raft log on every append")
     ap.add_argument("--state-dir", default=None, help="S4: where the Raft log is stored (default --out)")
     a = ap.parse_args(argv)

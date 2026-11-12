@@ -12,13 +12,13 @@ ICS 2403 Theme 3.
   **docs/assignment2/M4.md** (also as PDF), `TeleRM_S4_Architecture.png`, results in `results/M4*`
 
 ## Milestone 4: Raft-replicated orchestrator + Lamport clocks
-The orchestrator runs as 3 replicas (`orch-o1`, `orch-o2`, `orch-o3`; see `config.json` → `s4`).
+The orchestrator runs as 3 replicas (`orch-o1`, `orch-o2`, `orch-o3`; see `configs/config.json` → `s4`).
 They elect a leader, and every admission/release/resize is committed to a replicated log on a
 majority before it counts (`telerm/raft.py`). Every message carries a Lamport clock (`lc`).
 ```bash
 python -m experiments.m4_run smoke                       # 20 s demo: elect, admit, kill the leader, recover
-sh scripts/run_m4_all.sh && python -m analysis.analyze_m4     # all M4 experiments (about 35 min) + charts/tables
-python m3_run.py traffic --arch s4 --loads 150 --kill-leader-at 8 --policies tier_aware   # traffic during a leader crash
+sh scripts/run_m4_all.sh && python analyze_m4.py     # all M4 experiments (about 35 min) + charts/tables
+python -m experiments.m3_run traffic --arch s4 --loads 150 --kill-leader-at 8 --policies tier_aware   # traffic during a leader crash
 python -m telerm.deploy local                 # whole S4 system as local processes (--no-raft = S3 layout)
 python -m telerm.deploy compose > docker-compose.yml && docker compose up -d --build   # 12 containers
 ```
@@ -32,9 +32,9 @@ Services: registry, orchestrator, telemetry, two edge API gateways, four compute
 
 **Without Docker** (all services as local processes):
 ```bash
-python m3_run.py traffic --arch s3 --deploy local --policies tier_aware --loads 150 --measure 10
-python m3_run.py traffic --arch s2 --deploy local --policies least_loaded --loads 200   # S2 monolith, same workload
-python m3_run.py scalebench --sizes 4 64 256                                           # registry/orchestrator vs N sites
+python -m experiments.m3_run traffic --arch s3 --deploy local --policies tier_aware --loads 150 --measure 10
+python -m experiments.m3_run traffic --arch s2 --deploy local --policies least_loaded --loads 200   # S2 monolith, same workload
+python -m experiments.m3_run scalebench --sizes 4 64 256                                           # registry/orchestrator vs N sites
 python -m telerm.deploy local --policy tier_aware      # just start everything (Ctrl+C to stop)
 ```
 
@@ -42,7 +42,7 @@ python -m telerm.deploy local --policy tier_aware      # just start everything (
 ```bash
 python -m telerm.deploy compose > docker-compose.yml
 POLICY=tier_aware docker compose up -d --build
-docker compose run --rm loadgen python m3_run.py traffic --arch s3 --deploy external \
+docker compose run --rm loadgen python -m experiments.m3_run traffic --arch s3 --deploy external \
        --registry registry:8010 --delay-mode emulate --policies tier_aware --loads 150
 docker compose down
 python -m experiments.docker_sweep tiers        # edge_first vs least_loaded vs tier_aware, fresh stack per run
@@ -71,7 +71,7 @@ python -m experiments.perf_experiment --policies edge_first --loads 300 --reps 1
 ```
 Each run starts all nodes fresh, admits 10 service instances through the manager, then
 sends seeded Poisson traffic tasks straight to the sites and measures throughput, latency,
-jitter, packet loss, CPU and memory. Settings live in the `perf` section of `config.json`.
+jitter, packet loss, CPU and memory. Settings live in the `perf` section of `configs/config.json`.
 
 > Set `offered_loads` for your machine. A good range runs from well below to just above
 > the load where loss starts. On a 2-core machine that point is about 500 tasks/s.
@@ -79,7 +79,7 @@ jitter, packet loss, CPU and memory. Settings live in the `perf` section of `con
 
 **Several machines (recommended for real distributed results):** start the manager and
 the sites as shown in "Running across several machines" below, put the LAN addresses in
-`config.json`, then run `python -m experiments.perf_experiment --no-launch --policies edge_first`
+`configs/config.json`, then run `python -m experiments.perf_experiment --no-launch --policies edge_first`
 (the policy is the one the manager was started with).
 
 ## Milestone 1: admission demo (all nodes on one machine)
@@ -101,23 +101,23 @@ python -m experiments.run_demo --policy least_loaded      # edge_first | least_l
 python -m experiments.run_demo --rate 3 --window 40       # heavier load, longer run
 ```
 To change site capacities, links, the service catalogue, the workload or the seed, edit
-`config.json`.
+`configs/config.json`.
 
 > Every running instance is kept busy, so the worker processes use all the CPU they get
 > while instances are active. On a small machine, reduce `job_work_kb` or the site `slots`
-> in `config.json`.
+> in `configs/config.json`.
 
 ## Running across several machines
 Manager machine:
 ```bash
-python -m telerm.manager --bind 0.0.0.0 --port 8000 --topology config.json --policy edge_first --out results/lan_run
+python -m telerm.manager --bind 0.0.0.0 --port 8000 --topology configs/config.json --policy edge_first --out results/lan_run
 ```
 Each site machine (use that machine's LAN IP as `--host`):
 ```bash
 python -m telerm.site --id edge-A --tier edge --bind 0.0.0.0 --host 192.168.1.21 --port 8101 \
        --manager 192.168.1.10:8000 --cpu 4000 --mem 4096 --bw 2000 --slots 2
 ```
-Next, put the LAN addresses into `config.json` (`manager.host` and each site's `host`). Then
+Next, put the LAN addresses into `configs/config.json` (`manager.host` and each site's `host`). Then
 replay the workload from any machine:
 ```bash
 python -m experiments.run_demo --no-launch --out results/lan_run
@@ -143,17 +143,17 @@ telerm/
 experiments/run_demo.py         S1: launches all nodes, replays the admission workload, reports
 experiments/perf_experiment.py  S2: traffic generator + meter, runs the load sweep
 analyze.py          S2: charts and tables from runs.csv
-config.json         sites, links, services, S1 workload, S2 `perf` experiment, seed
+configs/config.json         sites, links, services, S1 workload, S2 `perf` experiment, seed
 docs/assignment1/M1.md           Milestone 1 design document and Week 1 failure log
 docs/assignment1/M2.md        Milestone 2 report and Week 2 failure log
-m3_run.py           S3: traffic runs (S2 or S3, local or Docker) and control-plane benchmark
+experiments/m3_run.py           S3: traffic runs (S2 or S3, local or Docker) and control-plane benchmark
 experiments/docker_sweep.py     S3: runs experiments on Docker Compose (fresh stack per run)
 analyze_m3.py       S3: charts and tables for Milestone 3
-run_m3_all.sh       S3: every Milestone 3 experiment in order
+scripts/run_m3_all.sh       S3: every Milestone 3 experiment in order
 Dockerfile          S3: one image for every service
 docs/assignment2/M3.md        Milestone 3 report and Week 3 failure log
 experiments/m4_run.py           S4: coordination experiments E1-E5 (+ fake sites, smoke demo)
-analysis/analyze_m4.py       S4: charts and tables for Milestone 4
+analyze_m4.py       S4: charts and tables for Milestone 4
 scripts/run_m4_all.sh       S4: every Milestone 4 experiment in order
 docs/assignment2/M4.md        Milestone 4 report and Week 4 failure log
 configs/config_m3.json      S3 configuration (frozen)
@@ -178,3 +178,21 @@ Milestone 1 (`experiments/run_demo.py`):
 | `allocations.jsonl` | Every accepted / blocked / resized / released event with reasons and paths |
 | `summary.json` | All requests and outcomes, 1 s utilisation time series, final state of every node |
 | `logs/*.log` | One log per node (shows real PIDs of nodes and worker processes) |
+
+
+---
+
+## Milestone 5 – distributed transactions (S5)
+
+Design, experiments and results: `docs/assignment3/M5.md` / `TeleRM_Milestone5_Report.pdf`.
+
+```
+python3 -m experiments.m5_run smoke                  # one chain with the naive baseline, 2PC and 3PC
+./run_m5_all.sh                          # all experiments (about 50 min), results in results/M5/
+python3 -m analysis.analyze_m5 results/M5         # summary tables (no charts)
+python3 -m experiments.real_sites                 # the same transaction on real site.py sites
+```
+
+New code: `telerm/txn.py` (participant, coordinator, crash points), `telerm/txnsite.py` (light participant process),
+`experiments/cluster.py` (process harness and invariant checker), `experiments/m5_run.py`, `analysis/analyze_m5.py`, `experiments/real_sites.py`.
+A request: `TXN_REQUEST {"request": {"parts": [...], "proto": "2pc"|"3pc"|"naive", "req_id": "..."}}` to the service `orchestrator`.

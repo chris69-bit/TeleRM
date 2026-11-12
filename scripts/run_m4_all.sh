@@ -10,8 +10,8 @@ echo "== E4: consistency (uncoordinated vs Raft)";     python3 -m experiments.m4
 echo "== E5: event ordering with skewed clocks";       python3 -m experiments.m4_run clocks      --reps 10 --out $OUT
 echo "== E6: whole system, traffic while the leader is killed"
 for rep in 1 2 3; do
-  python3 m3_run.py traffic --arch s3 --loads 150 --rep-start $rep --policies tier_aware --out results/M4-traffic
-  python3 m3_run.py traffic --arch s4 --loads 150 --rep-start $rep --policies tier_aware --out results/M4-traffic
-  python3 m3_run.py traffic --arch s4 --loads 150 --rep-start $rep --policies tier_aware --kill-leader-at 8 --tag kill --out results/M4-traffic
+  python3 -m experiments.m3_run traffic --arch s3 --loads 150 --rep-start $rep --policies tier_aware --out results/M4-traffic
+  python3 -m experiments.m3_run traffic --arch s4 --loads 150 --rep-start $rep --policies tier_aware --out results/M4-traffic
+  python3 -m experiments.m3_run traffic --arch s4 --loads 150 --rep-start $rep --policies tier_aware --kill-leader-at 8 --tag kill --out results/M4-traffic
 done
 echo "== all done"

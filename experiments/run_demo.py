@@ -200,7 +200,7 @@ def report(results, status, site_status, cfg):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=os.path.join(ROOT, "config.json"))
+    ap.add_argument("--config", default=os.path.join(ROOT, "configs/config.json"))
     ap.add_argument("--policy")
     ap.add_argument("--rate", type=float, help="override arrival rate (requests/s)")
     ap.add_argument("--window", type=float, help="override arrival window (s)")
