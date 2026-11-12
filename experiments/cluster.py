@@ -45,7 +45,7 @@ def rnd(x, d=2):
     return None if x is None else round(x, d)
 
 
-def parts_of(services, holding=2.0, sites=None, cpu=None):
+def parts_of(services, holding=2.0, sites=None, cpu=None, force=False):
     """A chain request: one part per site, e.g. parts_of(3, sites=['site0','site1','site2'])."""
     out = []
     for i in range(services):
@@ -53,13 +53,18 @@ def parts_of(services, holding=2.0, sites=None, cpu=None):
              "max_latency_ms": 100, "holding_s": holding}
         if sites:
             p["site"] = sites[i % len(sites)]
+        if force:
+            p["force"] = True
         out.append(p)
     return out
 
 
 class Cluster5:
     def __init__(self, run_dir, n_orch=3, n_sites=3, site_cpu=4000, delay_ms=0.0, fsync=False, indoubt_s=2.0,
-                 election="300,600", hb_ms=50, vote_no=0.0, vote_timeout=1.5):
+                 election="300,600", hb_ms=50, vote_no=0.0, vote_timeout=1.5, race="atomic", discipline="greedy",
+                 aging_s=1.5, detect_ms=0, stable_rounds=2, victim="youngest"):
+        self.race, self.discipline, self.aging_s = race, discipline, aging_s
+        self.detect_ms, self.stable_rounds, self.victim = detect_ms, stable_rounds, victim
         self.run_dir, self.n_orch, self.n_sites = run_dir, n_orch, n_sites
         self.site_cpu, self.delay_ms, self.fsync, self.indoubt_s = site_cpu, delay_ms, fsync, indoubt_s
         self.election, self.hb_ms, self.vote_no, self.vote_timeout = election, hb_ms, vote_no, vote_timeout
@@ -80,7 +85,8 @@ class Cluster5:
         a = [PY, "-m", "telerm.txnsite", "--id", self.site_names[k], "--port", str(SITE_BASE + k),
              "--registry", f"127.0.0.1:{REG_PORT}", "--cpu", str(self.site_cpu),
              "--wal-dir", os.path.join(self.run_dir, "wal"), "--delay-ms", str(self.delay_ms),
-             "--indoubt-s", str(self.indoubt_s), "--vote-no", str(self.vote_no)]
+             "--indoubt-s", str(self.indoubt_s), "--vote-no", str(self.vote_no), "--race", self.race,
+             "--discipline", self.discipline, "--aging-s", str(self.aging_s)]
         if self.fsync:
             a.append("--fsync")
         return a
@@ -91,7 +97,8 @@ class Cluster5:
         a = [PY, "-m", "telerm.manager", "--port", str(ORCH_BASE + i), "--registry", f"127.0.0.1:{REG_PORT}",
              "--topology", self.topo_path, "--policy", "least_loaded", "--out", os.path.join(self.run_dir, rid),
              "--raft-id", rid, "--raft-peers", peers, "--election-ms", self.election, "--heartbeat-ms",
-             str(self.hb_ms), "--vote-timeout", str(self.vote_timeout)]
+             str(self.hb_ms), "--vote-timeout", str(self.vote_timeout), "--detect-ms", str(self.detect_ms),
+             "--stable-rounds", str(self.stable_rounds), "--victim", self.victim]
         if self.fsync:
             a.append("--fsync")
         return a
@@ -174,8 +181,9 @@ class Cluster5:
         port = ORCH_BASE + self.ids.index(target) if target in self.ids else SITE_BASE + self.site_names.index(target)
         return await call("127.0.0.1", port, {"type": "FAULT", **kw}, timeout=2.0)
 
-    async def txn(self, parts, proto="2pc", req_id=None, timeout=10.0, retry_s=0.0):
-        msg = {"type": "TXN_REQUEST", "request": {"parts": parts, "proto": proto, "req_id": req_id}}
+    async def txn(self, parts, proto="2pc", req_id=None, timeout=10.0, retry_s=0.0, cc="nowait", lock_wait_s=2.0):
+        msg = {"type": "TXN_REQUEST", "request": {"parts": parts, "proto": proto, "req_id": req_id, "cc": cc,
+                                                  "lock_wait_s": lock_wait_s}}
         return await self.reg.call_service("orchestrator", msg, timeout=timeout, retry_s=retry_s)
 
     async def settle(self, t=30.0, need_done=True):

@@ -17,7 +17,7 @@ They elect a leader, and every admission/release/resize is committed to a replic
 majority before it counts (`telerm/raft.py`). Every message carries a Lamport clock (`lc`).
 ```bash
 python -m experiments.m4_run smoke                       # 20 s demo: elect, admit, kill the leader, recover
-sh scripts/run_m4_all.sh && python analyze_m4.py     # all M4 experiments (about 35 min) + charts/tables
+sh scripts/run_m4_all.sh && python -m analysis.analyze_m4     # all M4 experiments (about 35 min) + charts/tables
 python -m experiments.m3_run traffic --arch s4 --loads 150 --kill-leader-at 8 --policies tier_aware   # traffic during a leader crash
 python -m telerm.deploy local                 # whole S4 system as local processes (--no-raft = S3 layout)
 python -m telerm.deploy compose > docker-compose.yml && docker compose up -d --build   # 12 containers
@@ -51,7 +51,7 @@ python -m experiments.docker_sweep scaleout     # 1..4 identical compute sites
 On Windows PowerShell set the variable with `$env:POLICY="tier_aware"` first.
 
 All Milestone 3 experiments in one go (about an hour): `./run_m3_all.sh`, then
-`python analyze_m3.py` for charts (`results/M3-charts/`) and tables (`results/M3-summary.md`).
+`python -m analysis.analyze_m3` for charts (`results/M3-charts/`) and tables (`results/M3-summary.md`).
 
 ## Requirements
 Python 3.10 or newer, on Linux, macOS or Windows.
@@ -63,7 +63,7 @@ The S1 demo still runs without any packages; without psutil the CPU/memory colum
 ## Milestone 2: performance experiment
 ```bash
 python -m experiments.perf_experiment                  # full sweep: 2 policies x 7 loads x 3 repetitions (~20 min)
-python analyze.py results/<folder>         # charts + summary.md (tables)
+python -m analysis.analyze results/<folder>         # charts + summary.md (tables)
 ```
 Quick single run (about 30 s):
 ```bash
@@ -142,18 +142,18 @@ telerm/
   raft.py       S4: Raft consensus (election, log replication, commit, persistence)
 experiments/run_demo.py         S1: launches all nodes, replays the admission workload, reports
 experiments/perf_experiment.py  S2: traffic generator + meter, runs the load sweep
-analyze.py          S2: charts and tables from runs.csv
+analysis/analyze.py          S2: charts and tables from runs.csv
 configs/config.json         sites, links, services, S1 workload, S2 `perf` experiment, seed
 docs/assignment1/M1.md           Milestone 1 design document and Week 1 failure log
 docs/assignment1/M2.md        Milestone 2 report and Week 2 failure log
 experiments/m3_run.py           S3: traffic runs (S2 or S3, local or Docker) and control-plane benchmark
 experiments/docker_sweep.py     S3: runs experiments on Docker Compose (fresh stack per run)
-analyze_m3.py       S3: charts and tables for Milestone 3
+analysis/analyze_m3.py       S3: charts and tables for Milestone 3
 scripts/run_m3_all.sh       S3: every Milestone 3 experiment in order
 Dockerfile          S3: one image for every service
 docs/assignment2/M3.md        Milestone 3 report and Week 3 failure log
 experiments/m4_run.py           S4: coordination experiments E1-E5 (+ fake sites, smoke demo)
-analyze_m4.py       S4: charts and tables for Milestone 4
+analysis/analyze_m4.py       S4: charts and tables for Milestone 4
 scripts/run_m4_all.sh       S4: every Milestone 4 experiment in order
 docs/assignment2/M4.md        Milestone 4 report and Week 4 failure log
 configs/config_m3.json      S3 configuration (frozen)
@@ -168,7 +168,7 @@ Milestone 2 (`results/<folder>/`):
 | `runs.csv` | One row per run: every metric, per site |
 | `<policy>_<load>_r<rep>/tasks.csv` | Every task: send/receive time, status, queue/processing/communication time |
 | `<policy>_<load>_r<rep>/run.json` | Placement of each instance, 1 s resource time series |
-| `charts/`, `summary.md` | Produced by `analyze.py` |
+| `charts/`, `summary.md` | Produced by `analysis/analyze.py` |
 
 Milestone 1 (`experiments/run_demo.py`):
 
@@ -196,3 +196,22 @@ python3 -m experiments.real_sites                 # the same transaction on real
 New code: `telerm/txn.py` (participant, coordinator, crash points), `telerm/txnsite.py` (light participant process),
 `experiments/cluster.py` (process harness and invariant checker), `experiments/m5_run.py`, `analysis/analyze_m5.py`, `experiments/real_sites.py`.
 A request: `TXN_REQUEST {"request": {"parts": [...], "proto": "2pc"|"3pc"|"naive", "req_id": "..."}}` to the service `orchestrator`.
+
+
+---
+
+## Milestone 6 – concurrency and deadlock (S6)
+
+Design, experiments and results: `docs/assignment3/M6.md` / `docs/assignment3/TeleRM_Milestone6_Report.pdf`.
+
+```
+python3 -m experiments.m6_run smoke                  # a real deadlock, detected and resolved
+./run_m6_all.sh                          # all experiments (about 35 min), results in results/M6/
+python3 -m analysis.analyze_m6 results/M6         # summary tables (no charts)
+```
+
+New code: `telerm/deadlock.py` (resource-allocation graph, matrix detection, victim choice), lock manager in
+`Participant` (`telerm/txn.py`: wait queue, greedy/fifo/aging, atomic/locked/unsafe ledger), detector and ordered
+acquisition in `Coordinator`, `experiments/m6_run.py`, `analysis/analyze_m6.py`.
+A request: `TXN_REQUEST {"request": {"parts": [...], "proto": "2pc", "cc": "nowait|timeout|detect|waitdie|ordered", "lock_wait_s": 3.0}}`.
+Orchestrators: `--detect-ms 200 --stable-rounds 2 --victim youngest`. Sites/participants: `--discipline greedy|fifo|aging --race atomic|locked|unsafe`.

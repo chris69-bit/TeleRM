@@ -87,7 +87,8 @@ class Manager:
                                  heartbeat_ms=a.heartbeat_ms, peer_delay_ms=delays, fsync=a.fsync,
                                  on_role=self.on_role, commit_timeout=a.commit_timeout)
         self.admit_ms: list = []
-        self.txn = Coordinator(self, vote_timeout=a.vote_timeout) if a.raft_id else None     # S5
+        self.txn = (Coordinator(self, vote_timeout=a.vote_timeout, detect_s=a.detect_ms / 1000.0,
+                                stable_rounds=a.stable_rounds, victim_policy=a.victim) if a.raft_id else None)     # S5
 
     async def sync_sites(self):
         """S3: refresh the site list from the registry (capacity, address, tier, liveness)."""
@@ -587,6 +588,7 @@ class Manager:
                            for k, r in self.txn.sm.items()}
             out["txn_records"] = self.txn.records[-2000:]
             out["phase2_ms"] = dict(self.txn.phase2_ms)
+            out["detector"] = {k: v for k, v in self.txn.det.items() if k != "first_seen"}
             out["admit_ms_mean"] = round(sum(self.admit_ms) / len(self.admit_ms), 3) if self.admit_ms else None
         if full:
             out["timeseries"] = self.timeseries
@@ -611,6 +613,8 @@ class Manager:
         loops = [asyncio.create_task(self.failure_detector()), asyncio.create_task(self.sampler())]
         if self.txn:
             loops.append(asyncio.create_task(self.txn.maintenance()))
+            if self.txn.detect_s > 0:                        # S6: deadlock detector
+                loops.append(asyncio.create_task(self.txn.detector_loop()))
         await self.shutdown.wait()
         for l in loops:
             l.cancel()
@@ -638,6 +642,9 @@ def main(argv=None):
     ap.add_argument("--heartbeat-ms", type=float, default=50, help="S4: leader heartbeat interval (ms)")
     ap.add_argument("--peer-delay-ms", default="", help="S4: emulated one-way delay to peers, e.g. o2=5,o3=20")
     ap.add_argument("--commit-timeout", type=float, default=3.0)
+    ap.add_argument("--detect-ms", type=float, default=0.0, help="S6: deadlock detection interval (0 = off)")
+    ap.add_argument("--stable-rounds", type=int, default=2, help="S6: a deadlock must be seen this many rounds in a row")
+    ap.add_argument("--victim", default="youngest", choices=["youngest", "cheapest"], help="S6: victim policy")
     ap.add_argument("--vote-timeout", type=float, default=1.5, help="S5: wait this long for a PREPARE vote")
     ap.add_argument("--fsync", action="store_true", help="S4: fsync the Raft log on every append")
     ap.add_argument("--state-dir", default=None, help="S4: where the Raft log is stored (default --out)")

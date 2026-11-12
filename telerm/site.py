@@ -138,7 +138,7 @@ class Site:
     # ---------------------------------------------------------------- control plane
     async def handle(self, msg):
         t = msg.get("type")
-        if t in ("PREPARE", "PRECOMMIT", "COMMIT", "ABORT", "TXN_STATE", "DIRECT", "DIRECT_UNDO", "FAULT"):
+        if t in ("PREPARE", "PRECOMMIT", "COMMIT", "ABORT", "TXN_STATE", "DIRECT", "DIRECT_UNDO", "FAULT", "LOCKSTATE"):
             return await self.part.handle(msg)                # S5 transaction messages
         if t == "TASK":
             return await self.handle_task(msg)

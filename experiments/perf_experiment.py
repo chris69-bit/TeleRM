@@ -19,7 +19,7 @@ to every task's measured time as 2 x one-way delay. This is a model, stated as s
 
     python -m experiments.perf_experiment                         # full sweep from configs/config.json
     python -m experiments.perf_experiment --policies edge_first --loads 200 --measure 10   # one quick run
-    python analyze.py results/<folder>                # charts and tables
+    python -m analysis.analyze results/<folder>                # charts and tables
 """
 # repo root on sys.path (added by reorganize.py)
 import os as _rr_os, sys as _rr_sys
@@ -332,7 +332,7 @@ def main():
                     w = csv.DictWriter(f, fieldnames=keys)
                     w.writeheader()
                     w.writerows(rows)
-    print(f"\nResults saved to {out}\nNext: python analyze.py {out}")
+    print(f"\nResults saved to {out}\nNext: python -m analysis.analyze {out}")
 
 
 if __name__ == "__main__":

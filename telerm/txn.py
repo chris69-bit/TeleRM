@@ -32,6 +32,17 @@ Participant rules (all handlers are idempotent, every state change is written to
   (TXN_STATUS); if it cannot be reached, ask the other participants (cooperative termination;
   3PC: the termination protocol).
 
+S6 - concurrency: with cc != "nowait" a PREPARE that does not fit WAITS in a queue at the site
+(lock manager) instead of voting NO. Waiting while holding resources elsewhere is "hold and
+wait", so distributed deadlock becomes possible. Strategies (request field "cc"):
+  nowait   vote NO at once (S5; deadlock impossible, many aborts)
+  timeout  wait, give up after lock_wait_s (deadlock only ends by timeout)
+  detect   wait; the coordinator's detector finds deadlocks (telerm/deadlock.py) and aborts a victim
+  waitdie  wait only if older than every holder, else die (prevention with transaction timestamps)
+  ordered  acquire sites one after the other in a fixed order (prevention: no circular wait)
+Queue disciplines at a site: greedy (anyone who fits), fifo (no overtaking), aging (greedy, but a
+request that waited too long blocks overtaking). Race modes of the ledger: atomic, locked, unsafe.
+
 Fault injection (set with a FAULT message, used by experiments/m5_run.py): crash points such as
 "c_after_votes" or "p_after_prepared_log", dropped requests/replies, and pauses.
 """
@@ -41,6 +52,7 @@ import logging
 import os
 
 from .protocol import call, mono, now
+from .deadlock import assemble, detect, victim_of
 from .resources import NodeResources, Resources, evaluate_candidates, choose
 
 log = logging.getLogger("txn")
@@ -96,7 +108,8 @@ class Participant:
     """The resource manager of one site: a ledger of what is locked/used, plus a write-ahead log."""
 
     def __init__(self, site, capacity: Resources, wal_dir, *, fsync=False, delay_ms=0.0, indoubt_s=2.0,
-                 coord_call=None, start_instance=None, notify_exit=None, vote_no=0.0, seed=1):
+                 coord_call=None, start_instance=None, notify_exit=None, vote_no=0.0, seed=1,
+                 race="atomic", discipline="greedy", aging_s=1.5):
         self.site, self.capacity = site, capacity
         self.ledger = NodeResources(capacity)
         self.fsync, self.delay = fsync, delay_ms / 1000.0
@@ -106,7 +119,13 @@ class Participant:
         self.active: dict[str, dict] = {}          # sid -> {"txn", "demand", "expires_at"}
         self.stats = {"prepare": 0, "yes": 0, "no": 0, "commit": 0, "abort": 0, "precommit": 0, "dup": 0,
                       "violations": 0, "indoubt_resolved": 0, "indoubt_blocked_checks": 0, "wal_writes": 0,
-                      "wal_ms": 0.0, "direct": 0, "recovered_indoubt": 0, "recovered_active": 0}
+                      "wal_ms": 0.0, "direct": 0, "recovered_indoubt": 0, "recovered_active": 0, "granted_after_wait": 0, "lock_timeout": 0,
+                      "wait_die": 0, "cancelled": 0, "over_capacity_events": 0}
+        self.race, self.discipline, self.aging_s = race, discipline, aging_s   # S6
+        self.waiters: list = []                    # S6: requests waiting for resources at this site
+        self.wait_log: list = []                   # S6: how long each request waited, and how it ended
+        self.cs = asyncio.Lock()                   # S6: critical section for race="locked"
+        self.max_over = 0.0
         self.held_log: list = []                   # every PREPARED -> outcome: how long resources were locked
         self.indoubt_log: list = []                # how long each transaction was in doubt, and how it ended
         self.over_capacity = 0
@@ -195,7 +214,7 @@ class Participant:
             await asyncio.sleep(self.delay)
         fn = {"PREPARE": self.on_prepare, "PRECOMMIT": self.on_precommit, "COMMIT": self.on_commit,
               "ABORT": self.on_abort, "TXN_STATE": self.on_state, "DIRECT": self.on_direct,
-              "DIRECT_UNDO": self.on_direct_undo}.get(t)
+              "DIRECT_UNDO": self.on_direct_undo, "LOCKSTATE": self.on_lockstate}.get(t)
         if fn is None:
             return None
         r = await fn(m)
@@ -208,6 +227,115 @@ class Participant:
     def _touch(self, t):
         t["last_contact"] = now()
 
+    # ------------------------------------------------------------ S6: lock manager (wait queue)
+    def _blocked_by_queue(self, ts):
+        """May a NEW request take free resources now, or must it queue behind the waiters?"""
+        if not self.waiters:
+            return False
+        if self.discipline == "fifo":
+            return True
+        if self.discipline == "aging":
+            return any(mono() - w["t0"] > self.aging_s for w in self.waiters)
+        return False                                   # greedy: anyone who fits may go
+
+    def _grant(self):
+        """Resources were released: wake the waiters that may run now (according to the discipline)."""
+        if not self.waiters:
+            return
+        for w in list(self.waiters):
+            fits = self.ledger.can_allocate(w["demand"])
+            aged = mono() - w["t0"] > self.aging_s
+            if fits:
+                self.ledger.allocate(w["demand"])
+                self.waiters.remove(w)
+                self.stats["granted_after_wait"] += 1
+                self.wait_log.append({"txn": w["txn"], "wait_s": round(mono() - w["t0"], 4), "cpu": w["demand"].cpu,
+                                      "outcome": "GRANTED"})
+                if not w["fut"].done():
+                    w["fut"].set_result("GRANTED")
+            elif self.discipline == "fifo" or (self.discipline == "aging" and aged):
+                break                                  # the head of the line must not be overtaken
+
+    def _cancel_waiter(self, txn, why):
+        for w in list(self.waiters):
+            if w["txn"] == txn:
+                self.waiters.remove(w)
+                self.wait_log.append({"txn": txn, "wait_s": round(mono() - w["t0"], 4), "cpu": w["demand"].cpu,
+                                      "outcome": why})
+                if not w["fut"].done():
+                    w["fut"].set_result(why)
+                self._grant()                          # the head may have been removed
+                return True
+        return False
+
+    async def _acquire(self, txn, total, ts, mode, wait_s):
+        """Returns ("GRANTED", None) or ("NO", reason)."""
+        if self.vote_no and self.rng.random() < self.vote_no:
+            return "NO", "local_policy"
+        if self.race == "unsafe":                      # BUG ON PURPOSE: check ... await ... update
+            if self.ledger.can_allocate(total):
+                await asyncio.sleep(0.001)             # e.g. the WAL write that sits between check and update
+                self.ledger.allocated = self.ledger.allocated + total
+                over = self.ledger.allocated.cpu - self.capacity.cpu
+                if over > 1e-6:
+                    self.stats["over_capacity_events"] += 1
+                    self.max_over = max(self.max_over, over)
+                return "GRANTED", None
+            return "NO", "node_capacity"
+        if self.race == "locked":                      # mutual exclusion: one lock around check + update
+            async with self.cs:
+                if self.ledger.can_allocate(total) and not self._blocked_by_queue(ts):
+                    await asyncio.sleep(0.001)
+                    self.ledger.allocate(total)
+                    return "GRANTED", None
+        else:                                          # atomic: no await between check and update (S5)
+            if self.ledger.can_allocate(total) and not self._blocked_by_queue(ts):
+                self.ledger.allocate(total)
+                return "GRANTED", None
+        if mode == "nowait":
+            return "NO", "node_capacity"
+        if mode == "waitdie":
+            holders = [self.txn_ts(t) for t, r in self.txns.items() if r["state"] in (PREPARED, PRECOMMITTED)]
+            if any(ts > h for h in holders):           # younger than a holder: die instead of waiting
+                self.stats["wait_die"] += 1
+                return "NO", "wait_die"
+        w = {"txn": txn, "demand": total, "ts": ts, "t0": mono(), "fut": asyncio.get_running_loop().create_future()}
+        self.waiters.append(w)
+        try:
+            res = await asyncio.wait_for(asyncio.shield(w["fut"]), wait_s)
+        except asyncio.TimeoutError:
+            if w in self.waiters:
+                self.waiters.remove(w)
+                self.wait_log.append({"txn": txn, "wait_s": round(mono() - w["t0"], 4), "cpu": total.cpu,
+                                      "outcome": "TIMEOUT"})
+                self.stats["lock_timeout"] += 1
+                self._grant()
+                return "NO", "lock_timeout"
+            res = w["fut"].result() if w["fut"].done() else "CANCELLED"
+        if res == "GRANTED":
+            return "GRANTED", None
+        self.stats["cancelled"] += 1
+        return "NO", "cancelled"
+
+    def txn_ts(self, txn):
+        return int(txn[1:]) if txn[:1] in "TN" and txn[1:].isdigit() else 0
+
+    async def on_lockstate(self, m):
+        """Snapshot for the deadlock detector: who holds what here, who waits for what."""
+        alloc = {}
+        for t, r in self.txns.items():
+            if r["state"] in (PREPARED, PRECOMMITTED):
+                alloc[t] = Resources.from_dict(r["total"]).to_dict()
+        for sid, a in self.active.items():
+            key = a["txn"] or f"D:{sid}"
+            cur = Resources.from_dict(alloc.get(key, {}))
+            alloc[key] = (cur + Resources.from_dict(a["demand"])).to_dict()
+        waits = {w["txn"]: w["demand"].to_dict() for w in self.waiters}
+        active_cpu = sum(Resources.from_dict(a["demand"]).cpu for a in self.active.values())
+        return {"ok": True, "site": self.site, "cap": self.capacity.to_dict(), "free": self.ledger.free.to_dict(),
+                "active_cpu": active_cpu, "n_waiting": len(self.waiters),
+                "alloc": alloc, "waits": waits, "ts": {t: self.txn_ts(t) for t in set(alloc) | set(waits)}}
+
     async def on_prepare(self, m):
         txn = m["txn"]
         self.stats["prepare"] += 1
@@ -215,23 +343,31 @@ class Participant:
         if t is not None:                              # a retried PREPARE: same answer as before
             self.stats["dup"] += 1
             self._touch(t)
-            return {"ok": True, "vote": "NO" if t["state"] == ABORTED else "YES", "dup": True}
+            return {"ok": True, "vote": "NO" if t["state"] in (ABORTED, "WAITING") else "YES", "dup": True}
         await fp("p_before_vote", txn)
+        dd = max([float(p.get("debug_delay_ms", 0)) for p in m["parts"]] or [0])
+        if dd:
+            await asyncio.sleep(dd / 1000.0)           # test hook: make two transactions interleave on purpose
+            if self.txns.get(txn) is not None:         # aborted by the coordinator while we were delayed
+                return {"ok": True, "vote": "NO", "reason": "cancelled"}
         total = Resources()
         for p in m["parts"]:
             total = total + Resources.from_dict(p["demand"])
-        reason = None
-        if self.vote_no and self.rng.random() < self.vote_no:
-            reason = "local_policy"
-        elif not self.ledger.can_allocate(total):      # check and lock in one step (no await in between)
-            reason = "node_capacity"
-        if reason:
+        self.txns[txn] = {"state": "WAITING", "parts": [], "total": {}, "participants": {}, "proto": m["proto"],
+                          "t_wall": now(), "last_contact": now()}
+        outcome, reason = await self._acquire(txn, total, int(m.get("ts", self.txn_ts(txn))), m.get("cc", "nowait"),
+                                              float(m.get("lock_wait_s", 2.0)))
+        cur = self.txns.get(txn)
+        if outcome == "GRANTED" and cur is not None and cur["state"] == ABORTED:      # aborted while waiting
+            self.ledger.release(total)
+            self._grant()
+            outcome, reason = "NO", "cancelled"
+        if outcome != "GRANTED":
             self.stats["no"] += 1
             self.txns[txn] = {"state": ABORTED, "parts": [], "total": {}, "participants": {}, "proto": m["proto"],
                               "t_wall": now(), "last_contact": now()}
             self._log({"r": "ABORTED", "txn": txn, "t": now(), "why": reason})
             return {"ok": True, "vote": "NO", "reason": reason}
-        self.ledger.allocate(total)
         t = {"state": PREPARED, "parts": m["parts"], "total": total.to_dict(), "participants": m["participants"],
              "proto": m["proto"], "t_wall": now(), "last_contact": now(), "coord": m.get("coord")}
         self.txns[txn] = t
@@ -302,7 +438,14 @@ class Participant:
         if t["state"] == COMMITTED:
             self.stats["violations"] += 1
             return {"ok": False, "error": "already_committed"}
+        if t["state"] == "WAITING":                    # S6: still queued: take it out of the queue
+            t["state"] = ABORTED
+            self._cancel_waiter(txn, "CANCELLED")
+            self._log({"r": "ABORTED", "txn": txn, "t": now(), "why": how})
+            self.stats["abort"] += 1
+            return {"ok": True}
         self.ledger.release(Resources.from_dict(t["total"]))
+        self._grant()
         t["state"] = ABORTED
         t["prepared_s"] = now() - t["t_wall"]
         self.held_log.append({"txn": txn, "held_s": round(t["prepared_s"], 4), "cpu": Resources.from_dict(t["total"]).cpu,
@@ -336,6 +479,7 @@ class Participant:
         a = self.active.pop(m["sid"], None)
         if a:
             self.ledger.release(Resources.from_dict(a["demand"]))
+            self._grant()
             self._log({"r": "DIRECT_UNDO", "sid": m["sid"]})
         return {"ok": True}
 
@@ -345,6 +489,7 @@ class Participant:
         if a is None:
             return
         self.ledger.release(Resources.from_dict(a["demand"]))
+        self._grant()
         self._log({"r": "EXIT", "sid": sid, "t": now()})
         if self.notify_exit:
             await self.notify_exit(sid)
@@ -434,6 +579,7 @@ class Participant:
         return {"site": self.site, "capacity": self.capacity.to_dict(), "allocated": self.ledger.allocated.to_dict(),
                 "active": {k: v["demand"] for k, v in self.active.items()},
                 "txns": {k: v["state"] for k, v in self.txns.items()}, "stats": dict(self.stats),
+                "wait_log": list(self.wait_log[-5000:]), "max_over": self.max_over, "waiting": len(self.waiters),
                 "indoubt_log": list(self.indoubt_log), "held_log": list(self.held_log[-5000:]), "faults": list(FAULT_LOG)}
 
 
@@ -441,8 +587,15 @@ class Participant:
 class Coordinator:
     """Transaction coordinator running inside the orchestrator (the Raft leader drives)."""
 
-    def __init__(self, mgr, vote_timeout=1.5, phase_timeout=1.0, phase2_deadline=60.0):
+    def __init__(self, mgr, vote_timeout=1.5, phase_timeout=1.0, phase2_deadline=60.0, detect_s=0.0,
+                 stable_rounds=2, victim_policy="youngest"):
         self.m = mgr
+        self.detect_s, self.stable_rounds, self.victim_policy = detect_s, stable_rounds, victim_policy   # S6
+        self.cc: dict = {}                         # txn -> (cc mode, lock wait) for the transactions this node drives
+        self.victims: dict = {}                    # txn -> reason it was aborted by the detector
+        self.det = {"rounds": 0, "msgs": 0, "deadlocks": 0, "victims": 0, "detect_ms": [], "first_seen": {},
+                    "resolve_s": [], "events": []}
+        self._prev_dead: dict = {}
         self.vote_timeout, self.phase_timeout, self.phase2_deadline = vote_timeout, phase_timeout, phase2_deadline
         self.sm: dict[str, dict] = {}              # replicated: txn -> record
         self.req_index: dict[str, str] = {}
@@ -540,6 +693,9 @@ class Coordinator:
                 feas, reasons = evaluate_candidates(d, p["ingress"], float(p.get("max_latency_ms", 1e9)), scratch, m.topo)
                 if p.get("site"):
                     feas = [f for f in feas if f[0] == p["site"]]
+                    if p.get("force") and p["site"] in scratch:      # S6 tests: let the SITE decide (skip the view check)
+                        path, lat = m.topo.paths_from(p["ingress"]).get(p["site"], ([], 0.0))
+                        feas = [(p["site"], path, lat)]
                 pick = choose(feas, d, p["ingress"], scratch, m.policy, m.tiers())
                 if pick is None:
                     return None, (max(reasons, key=reasons.get) if reasons else "no_sites")
@@ -550,7 +706,7 @@ class Coordinator:
                 sv = m.sites[site]
                 plan.append({"i": i, "site": site, "path": path, "latency_ms": lat, "service": p["service"],
                              "ingress": p["ingress"], "demand": d.to_dict(), "holding_s": float(p["holding_s"]),
-                             "cap": sv["res"].capacity.to_dict(), "host": sv["host"], "port": sv["port"],
+                             "debug_delay_ms": p.get("debug_delay_ms", 0), "cap": sv["res"].capacity.to_dict(), "host": sv["host"], "port": sv["port"],
                              "tier": sv.get("tier")})
             return plan, None
         finally:
@@ -591,6 +747,7 @@ class Coordinator:
                     return {"ok": False, "status": "BLOCKED", "reason": res.get("reason")}
                 txn = res["txn"]
                 t_plan = (plan_ms, begin_ms)
+                self.cc[txn] = (r.get("cc", "nowait"), float(r.get("lock_wait_s", 2.0)))
                 self.driving.add(txn)                    # only for a transaction THIS request created
         if t_plan is None:                               # retry: wait for the outcome of the existing txn
             for _ in range(300):
@@ -633,29 +790,47 @@ class Coordinator:
         out = {"txn": txn}
         await fp("c_after_begin", txn)
         # ---- phase 1: PREPARE / vote
+        cc, lock_wait = self.cc.get(txn, ("nowait", 2.0))
+        ts = int(txn[1:])
         tp = mono()
         votes = {}
+        wait_extra = lock_wait if cc != "nowait" else 0.0
 
         async def ask(site, parts):
             try:
                 r = await self._send(site, {"type": "PREPARE", "txn": txn, "proto": proto, "parts": parts,
-                                            "participants": addrs, "coord": "orchestrator"}, self.vote_timeout)
+                                            "participants": addrs, "coord": "orchestrator", "cc": cc, "ts": ts,
+                                            "lock_wait_s": lock_wait}, self.vote_timeout + wait_extra + 1.0)
                 return site, r.get("vote", "NO"), r.get("reason")
             except Exception:
                 self.stats["timeouts"] += 1
                 return site, "NO", "timeout"
         first = True
-        for fut in asyncio.as_completed([ask(s, p) for s, p in by_site.items()]):
-            site, vote, why = await fut
-            votes[site] = (vote, why)
-            if first:
-                first = False
-                await fp("c_after_first_vote", txn)
+        if cc == "ordered":                          # prevention: take the sites one by one in a fixed order
+            for site in sorted(by_site):
+                site, vote, why = await ask(site, by_site[site])
+                votes[site] = (vote, why)
+                if first:
+                    first = False
+                    await fp("c_after_first_vote", txn)
+                if vote != "YES":
+                    break
+            for site in by_site:
+                votes.setdefault(site, ("NO", "not_asked"))
+        else:
+            for fut in asyncio.as_completed([ask(s, p) for s, p in by_site.items()]):
+                site, vote, why = await fut
+                votes[site] = (vote, why)
+                if first:
+                    first = False
+                    await fp("c_after_first_vote", txn)
         out["prepare_ms"] = round((mono() - tp) * 1000, 3)
         all_yes = all(v[0] == "YES" for v in votes.values())
         out["votes"] = {s: v[0] for s, v in votes.items()}
         if not all_yes:
-            out["reason"] = next((v[1] for v in votes.values() if v[0] != "YES"), "no")
+            out["reason"] = next((v[1] for v in votes.values() if v[0] != "YES" and v[1] != "not_asked"), "no")
+            if txn in self.victims:
+                out["reason"] = "deadlock_victim"
             self.stats["no_votes"] += 1
         await fp("c_after_votes", txn)
         msgs = 2 * k
@@ -728,6 +903,61 @@ class Coordinator:
             log.warning("phase 2 of %s interrupted: %r", txn, exc)   # leadership lost: the next leader redoes it
         finally:
             self.driving.discard(txn)
+
+    # ------------------------------------------------------------ S6: deadlock detector (runs on the leader)
+    async def detector_loop(self):
+        """Every detect_s: collect LOCKSTATE from all sites, build the resource-allocation graph, run the
+        matrix detection, and abort one victim per deadlock that has been seen in stable_rounds rounds."""
+        while not self.m.shutdown.is_set():
+            await asyncio.sleep(self.detect_s)
+            if not self.m.raft.is_ready():
+                continue
+            t0 = mono()
+            sites = [sid for sid, sv in self.m.sites.items() if sv["status"] == "ALIVE"]
+
+            async def snap(sid):
+                try:
+                    return await self._send(sid, {"type": "LOCKSTATE"}, 0.8)
+                except Exception:
+                    return None
+            snaps = [x for x in await asyncio.gather(*[snap(s_) for s_ in sites]) if x]
+            self.det["rounds"] += 1
+            self.det["msgs"] += 2 * len(sites)
+            free, alloc, req, ts = assemble(snaps)
+            dead = detect(free, alloc, req)
+            self.det["detect_ms"].append(round((mono() - t0) * 1000, 3))
+            now_set = set(dead)
+            stable = [t for t in dead if self._prev_dead.get(t, 0) + 1 >= self.stable_rounds]
+            self._prev_dead = {t: self._prev_dead.get(t, 0) + 1 for t in now_set}
+            for t in dead:
+                self.det["first_seen"].setdefault(t, mono())
+            if not stable:
+                continue
+            self.det["deadlocks"] += 1
+            cand = [t for t in stable if self.sm.get(t, {}).get("state") == "BEGUN"]
+            v = victim_of(cand, alloc, ts, self.victim_policy)
+            self.det["events"].append({"t": round(now(), 3), "deadlocked": stable, "victim": v})
+            if v:
+                await self.abort_victim(v)
+
+    async def abort_victim(self, txn):
+        rec = self.sm.get(txn)
+        if rec is None or rec["state"] != "BEGUN":
+            return
+        self.victims[txn] = "deadlock"
+        self.det["victims"] += 1
+        try:
+            await self.m.raft.propose({"op": "TXN_DECIDE", "txn": txn, "decision": "ABORT"})
+        except Exception:
+            return
+        if txn in self.det["first_seen"]:
+            self.det["resolve_s"].append(round(mono() - self.det["first_seen"][txn], 3))
+        by_site, _ = self._participants(rec)
+        for site in by_site:                         # wake the queued request at the site: it votes NO
+            try:
+                await self._send(site, {"type": "ABORT", "txn": txn}, 0.8)
+            except Exception:
+                pass
 
     # ------------------------------------------------------------ recovery and status
     async def terminate_by_participants(self, rec):

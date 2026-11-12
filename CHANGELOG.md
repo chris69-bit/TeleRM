@@ -2,6 +2,11 @@
 
 What each milestone added. `git diff mN-1 mN` shows the exact changes; `git diff a1 a2` compares whole assignments.
 
+## M6 - Concurrency and deadlock (Assignment 3)
+- new modules: deadlock.py
+- new files: DESIGN.md, DESIGN_M2.md, DESIGN_M3.md, DESIGN_M4.md, DESIGN_M6.md, TeleRM_Milestone6_Report.pdf, analyze.py, analyze_m3.py, analyze_m4.py, analyze_m6.py, m6_run.py, run_m6_all.sh
+- (write 2-3 lines here in your own words)
+
 ## M5 - Distributed transactions (2PC, 3PC) (Assignment 3)
 - new modules: txn.py, txnsite.py
 - new files: DESIGN_M5.md, analyze_m5.py, build_report.sh, config.json, m3_run.py, m5_cluster.py, m5_real_sites.py, m5_run.py, report.css, run_m3_all.sh, run_m5_all.sh, smoke5.py

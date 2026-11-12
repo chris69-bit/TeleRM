@@ -45,7 +45,8 @@ async def main_async(a):
 
     part_obj = Participant(a.id, Resources(a.cpu, a.mem, a.bw), a.wal_dir, fsync=a.fsync, delay_ms=a.delay_ms,
                            indoubt_s=a.indoubt_s, coord_call=coord_call, start_instance=start_instance,
-                           notify_exit=notify_exit, vote_no=a.vote_no)
+                           notify_exit=notify_exit, vote_no=a.vote_no, race=a.race,
+                           discipline=a.discipline, aging_s=a.aging_s)
 
     async def handle(m):
         if m.get("type") == "SHUTDOWN":
@@ -76,6 +77,9 @@ def main():
     ap.add_argument("--fsync", action="store_true")
     ap.add_argument("--delay-ms", type=float, default=0.0, help="emulated one-way network delay to this site")
     ap.add_argument("--indoubt-s", type=float, default=2.0)
+    ap.add_argument("--race", default="atomic", choices=["atomic", "locked", "unsafe"], help="S6 ledger update mode")
+    ap.add_argument("--discipline", default="greedy", choices=["greedy", "fifo", "aging"], help="S6 queue discipline")
+    ap.add_argument("--aging-s", type=float, default=1.5)
     ap.add_argument("--vote-no", type=float, default=0.0)
     a = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format=f"%(asctime)s [{a.id}] %(name)s: %(message)s")
