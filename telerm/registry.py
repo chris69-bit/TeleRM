@@ -7,6 +7,10 @@ Before S3 the manager did everything. In S3 these jobs moved into their own serv
   * routes        - which site hosts service instance S00007 (set by the orchestrator, read by
                     the gateways), so users never need to know where an instance runs
 
+S4: REGISTER may carry a "term". The orchestrator cluster's leader registers the alias
+"orchestrator" with its Raft term; a REGISTER with an older term than the stored one is
+refused (fencing), so a deposed leader can never steal the name back.
+
 Messages: REGISTER, HEARTBEAT, LOOKUP, LIST_SITES, ROUTE_SET, ROUTE_DEL, RESOLVE, STATUS, SHUTDOWN
 
 Run:  python -m telerm.registry --port 8010
@@ -54,12 +58,18 @@ class Registry:
     def _handle(self, t, msg):
         if t == "REGISTER":
             name = msg["name"]
-            rec = {"name": name, "kind": msg.get("kind", "site"), "host": msg["host"], "port": msg["port"],
+            old = self.nodes.get(name)
+            term = msg.get("term")                 # S4: the leader alias carries its Raft term
+            if term is not None and old is not None and (old.get("term") or -1) > term:
+                self.event("stale_register_refused", name=name, term=term, current=old.get("term"))
+                return {"ok": False, "error": "STALE_TERM", "current_term": old.get("term")}
+            rec = {"term": term, "name": name, "kind": msg.get("kind", "site"), "host": msg["host"], "port": msg["port"],
                    "tier": msg.get("tier"), "location": msg.get("location", name), "pid": msg.get("pid"),
                    "capacity": msg.get("capacity"), "status": "ALIVE", "last_hb": now(),
                    "registered_at": now(), "resources": None}
             self.nodes[name] = rec
-            self.event("registered", name=name, kind=rec["kind"])
+            self.event("registered", name=name, kind=rec["kind"], term=term,
+                       address=f"{rec['host']}:{rec['port']}")
             log.info("%s %s registered at %s:%s", rec["kind"], name, rec["host"], rec["port"])
             return {"ok": True}
         if t == "HEARTBEAT":
@@ -78,7 +88,7 @@ class Registry:
             if rec is None:
                 return {"ok": False, "error": "unknown name"}
             return {"ok": True, "address": f"{rec['host']}:{rec['port']}", "status": rec["status"],
-                    "location": rec["location"], "tier": rec["tier"]}
+                    "location": rec["location"], "tier": rec["tier"], "term": rec.get("term")}
         if t == "LIST_SITES":
             return {"ok": True, "sites": [
                 {k: r[k] for k in ("name", "host", "port", "tier", "location", "capacity", "status", "pid")}

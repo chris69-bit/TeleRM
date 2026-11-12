@@ -68,13 +68,34 @@ class RegistryClient:
     def forget(self, name: str):
         self.cache.pop(name, None)
 
-    async def call_service(self, name: str, msg: dict, timeout: float = 5.0):
-        """Send a message to a named service; on failure, look the name up again once."""
-        try:
-            return await call(*(await self.lookup(name)), msg, timeout=timeout)
-        except Exception:
-            self.forget(name)
-            return await call(*(await self.lookup(name)), msg, timeout=timeout)
+    async def call_service(self, name: str, msg: dict, timeout: float = 5.0, retry_s: float = 0.0):
+        """Send a message to a named service; on failure, look the name up again.
+
+        S4: a replicated service answers NOT_LEADER from a follower (with a hint), or does not
+        answer at all while a new leader is being elected. With retry_s > 0 the client keeps
+        re-resolving the name and retrying for up to retry_s seconds (failover transparency).
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + retry_s
+        attempt, hint = 0, None
+        while True:
+            attempt += 1
+            try:
+                target = hint or await self.lookup(name, fresh=attempt > 1)
+                hint = None
+                r = await call(*target, msg, timeout=timeout)
+                if r.get("error") != "NOT_LEADER":
+                    self.cache[name] = target
+                    return r
+                if r.get("leader_addr"):              # a follower told us who the leader is
+                    hint = split_addr(r["leader_addr"])
+            except Exception:
+                self.forget(name)
+                if attempt >= 2 and loop.time() >= deadline:
+                    raise
+            if attempt >= 2 and loop.time() >= deadline:
+                return r
+            await asyncio.sleep(0.05 if attempt < 4 else 0.15)
 
     async def rpc(self, msg: dict, timeout: float = 5.0):
         return await call(*self.addr, msg, timeout=timeout)

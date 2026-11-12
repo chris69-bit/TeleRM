@@ -43,7 +43,7 @@ def run_one(compose_file, env, loadgen_args):
     sh(base + ["down", "--remove-orphans"], env, check=False, quiet=True)
     sh(base + ["up", "-d"], env, quiet=True)
     try:
-        sh(base + ["run", "--rm", "loadgen", "python", "-m", "experiments.m3_run", "traffic", "--arch", "s3", "--deploy", "external",
+        sh(base + ["run", "--rm", "loadgen", "python", "m3_run.py", "traffic", "--arch", "s3", "--deploy", "external",
                    "--registry", "registry:8010"] + loadgen_args, env)
     finally:
         sh(base + ["down", "--remove-orphans"], env, check=False, quiet=True)

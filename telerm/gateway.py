@@ -96,7 +96,7 @@ class Gateway:
         if t == "REQUEST":
             self.counters["requests"] += 1
             return await self.reg.call_service("orchestrator", {"type": "REQUEST", "request": msg["request"]},
-                                               timeout=10.0)
+                                               timeout=10.0, retry_s=5.0)
         if t == "STATUS":
             return {"ok": True, "status": {"name": self.a.name, "pid": os.getpid(), "counters": dict(self.counters),
                                            "routes_cached": len(self.routes), "comm": dict(STATS)}}

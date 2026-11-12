@@ -10,10 +10,19 @@ Two ways to talk (S2):
              back in a different order still reach the right caller. Used for TASK traffic.
 
 Servers accept both: a connection may carry one message or many.
+
+S4 - logical time. Every message carries a Lamport clock value "lc":
+  * before an event or a send, a process increments its counter;
+  * a message carries the counter value at the moment it is sent;
+  * on receive, the counter becomes max(own, received) + 1.
+So if event a can have caused event b, lc(a) < lc(b), whatever the wall clocks say.
+TELERM_CLOCK_SKEW_MS shifts this process's wall clock (to test ordering with wrong clocks).
+TELERM_EVENTLOG=<file> makes log_event() write {node, kind, lc, wall, ...} lines to that file.
 """
 import asyncio
 import itertools
 import json
+import os
 import struct
 import time
 
@@ -25,8 +34,39 @@ STATS = {"msgs_sent": 0, "bytes_sent": 0, "msgs_recv": 0, "bytes_recv": 0,
          "call_errors": 0, "connections_opened": 0}
 
 
+SKEW_S = float(os.environ.get("TELERM_CLOCK_SKEW_MS", "0")) / 1000.0
+CLOCK = {"lc": 0}                      # this process's Lamport clock
+_EVENTLOG = None
+NODE = {"name": os.environ.get("TELERM_NODE", f"pid{os.getpid()}")}
+
+
 def now() -> float:
-    return time.time()
+    """Wall-clock time (seconds). Includes the injected skew, like a badly synchronised clock."""
+    return time.time() + SKEW_S
+
+
+def tick() -> int:
+    """Lamport rule 1: a local event (or a send) increments the clock."""
+    CLOCK["lc"] += 1
+    return CLOCK["lc"]
+
+
+def observe(lc) -> None:
+    """Lamport rule 2: on receive, jump past the sender's clock."""
+    if isinstance(lc, int):
+        CLOCK["lc"] = max(CLOCK["lc"], lc) + 1
+
+
+def log_event(kind: str, **kw) -> None:
+    """Record an event with both its Lamport time and its (possibly skewed) wall time."""
+    global _EVENTLOG
+    path = os.environ.get("TELERM_EVENTLOG")
+    if not path:
+        return
+    if _EVENTLOG is None:
+        _EVENTLOG = open(path, "a", buffering=1)
+    _EVENTLOG.write(json.dumps({"node": NODE["name"], "kind": kind, "lc": tick(), "wall": now(), **kw},
+                               separators=(",", ":")) + "\n")
 
 
 def mono() -> float:
@@ -35,7 +75,7 @@ def mono() -> float:
 
 
 async def send_msg(writer: asyncio.StreamWriter, msg: dict) -> None:
-    body = json.dumps(msg, separators=(",", ":")).encode("utf-8")
+    body = json.dumps({**msg, "lc": tick()}, separators=(",", ":")).encode("utf-8")
     writer.write(_HDR.pack(len(body)) + body)
     await writer.drain()
     STATS["msgs_sent"] += 1
@@ -49,7 +89,9 @@ async def recv_msg(reader: asyncio.StreamReader) -> dict:
     body = await reader.readexactly(length)
     STATS["msgs_recv"] += 1
     STATS["bytes_recv"] += _HDR.size + length
-    return json.loads(body)
+    msg = json.loads(body)
+    observe(msg.get("lc"))
+    return msg
 
 
 async def call(host: str, port: int, msg: dict, timeout: float = 5.0) -> dict:

@@ -7,4 +7,4 @@ ENV PYTHONUNBUFFERED=1
 COPY requirements.txt .
 RUN python -c "import psutil" 2>/dev/null || pip install --no-cache-dir "psutil>=5.9"
 COPY telerm/ telerm/
-COPY config.json configs/config_m2.json experiments/run_demo.py experiments/perf_experiment.py experiments/m3_run.py ./
+COPY config.json configs/config_m2.json configs/config_m3.json experiments/run_demo.py experiments/perf_experiment.py m3_run.py experiments/m4_run.py ./

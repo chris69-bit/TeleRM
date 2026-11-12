@@ -1,4 +1,4 @@
-# TeleRM – Distributed Telecom Resource Management System (S3)
+# TeleRM – Distributed Telecom Resource Management System (S4)
 
 ICS 2403 Theme 3.
 - Milestone 1 (S1, Distributed OS Foundation): **docs/assignment1/M1.md**, `TeleRM_S1_Architecture.png`
@@ -7,6 +7,24 @@ ICS 2403 Theme 3.
   (reproduce with `--config configs/config_m2.json`)
 - Milestone 3 (S3, Distributed Architecture, edge ↔ core ↔ cloud microservices): **docs/assignment2/M3.md**
   (also as PDF), `TeleRM_S3_Architecture.png`, results in `results/M3-*`
+  (reproduce with `--config configs/config_m3.json`)
+- Milestone 4 (S4, Distributed Algorithms and Coordination: Raft + Lamport clocks):
+  **docs/assignment2/M4.md** (also as PDF), `TeleRM_S4_Architecture.png`, results in `results/M4*`
+
+## Milestone 4: Raft-replicated orchestrator + Lamport clocks
+The orchestrator runs as 3 replicas (`orch-o1`, `orch-o2`, `orch-o3`; see `config.json` → `s4`).
+They elect a leader, and every admission/release/resize is committed to a replicated log on a
+majority before it counts (`telerm/raft.py`). Every message carries a Lamport clock (`lc`).
+```bash
+python -m experiments.m4_run smoke                       # 20 s demo: elect, admit, kill the leader, recover
+sh scripts/run_m4_all.sh && python -m analysis.analyze_m4     # all M4 experiments (about 35 min) + charts/tables
+python m3_run.py traffic --arch s4 --loads 150 --kill-leader-at 8 --policies tier_aware   # traffic during a leader crash
+python -m telerm.deploy local                 # whole S4 system as local processes (--no-raft = S3 layout)
+python -m telerm.deploy compose > docker-compose.yml && docker compose up -d --build   # 12 containers
+```
+Single replica options: `python -m telerm.manager --raft-id o1 --raft-peers o1=host:8000,o2=host:8001,o3=host:8002
+--registry host:8010 [--election-ms 300,600 --heartbeat-ms 50 --peer-delay-ms o3=20 --fsync]`.
+Clock-skew experiments: `TELERM_CLOCK_SKEW_MS=5 TELERM_EVENTLOG=events.jsonl python -m ...`.
 
 ## Milestone 3: microservices over edge, core and cloud
 Services: registry, orchestrator, telemetry, two edge API gateways, four compute sites
@@ -14,9 +32,9 @@ Services: registry, orchestrator, telemetry, two edge API gateways, four compute
 
 **Without Docker** (all services as local processes):
 ```bash
-python -m experiments.m3_run traffic --arch s3 --deploy local --policies tier_aware --loads 150 --measure 10
-python -m experiments.m3_run traffic --arch s2 --deploy local --policies least_loaded --loads 200   # S2 monolith, same workload
-python -m experiments.m3_run scalebench --sizes 4 64 256                                           # registry/orchestrator vs N sites
+python m3_run.py traffic --arch s3 --deploy local --policies tier_aware --loads 150 --measure 10
+python m3_run.py traffic --arch s2 --deploy local --policies least_loaded --loads 200   # S2 monolith, same workload
+python m3_run.py scalebench --sizes 4 64 256                                           # registry/orchestrator vs N sites
 python -m telerm.deploy local --policy tier_aware      # just start everything (Ctrl+C to stop)
 ```
 
@@ -24,7 +42,7 @@ python -m telerm.deploy local --policy tier_aware      # just start everything (
 ```bash
 python -m telerm.deploy compose > docker-compose.yml
 POLICY=tier_aware docker compose up -d --build
-docker compose run --rm loadgen python -m experiments.m3_run traffic --arch s3 --deploy external \
+docker compose run --rm loadgen python m3_run.py traffic --arch s3 --deploy external \
        --registry registry:8010 --delay-mode emulate --policies tier_aware --loads 150
 docker compose down
 python -m experiments.docker_sweep tiers        # edge_first vs least_loaded vs tier_aware, fresh stack per run
@@ -33,7 +51,7 @@ python -m experiments.docker_sweep scaleout     # 1..4 identical compute sites
 On Windows PowerShell set the variable with `$env:POLICY="tier_aware"` first.
 
 All Milestone 3 experiments in one go (about an hour): `./run_m3_all.sh`, then
-`python -m analysis.analyze_m3` for charts (`results/M3-charts/`) and tables (`results/M3-summary.md`).
+`python analyze_m3.py` for charts (`results/M3-charts/`) and tables (`results/M3-summary.md`).
 
 ## Requirements
 Python 3.10 or newer, on Linux, macOS or Windows.
@@ -109,30 +127,36 @@ Open ports 8000 and 8101–8103 in each machine's firewall.
 ## Project layout
 ```
 telerm/
-  protocol.py   length-prefixed JSON over TCP; call() for control, Channel for traffic (S2)
+  protocol.py   length-prefixed JSON over TCP; call() / Channel (S2); Lamport clock on every message (S4)
   resources.py  node resource vector, topology, link reservations, admission checks, placement
   process.py    service-instance record and enforced state machine
   scheduler.py  stride scheduler (proportional share of CPU = allocation; work-conserving in S2)
   site.py       site node: ALLOCATE/RESIZE/RELEASE, TASK queues (S2), worker pool, heartbeats
-  manager.py    global resource manager: registry, admission, placement, allocation table
+  manager.py    global resource manager / orchestrator; S4: Raft replica + replicated state machine
   monitor.py    S2: measures real CPU % and memory of a node (psutil)
   registry.py   S3: naming, liveness, routes (instance -> site)
   telemetry.py  S3: collects measurements from every node
   gateway.py    S3: edge API gateway, only entry for users; injects link delay
   naming.py     S3: registry client used by every service
-  deploy.py     S3: start all services locally, or generate docker-compose.yml
+  deploy.py     S3/S4: start all services locally, or generate docker-compose.yml
+  raft.py       S4: Raft consensus (election, log replication, commit, persistence)
 experiments/run_demo.py         S1: launches all nodes, replays the admission workload, reports
 experiments/perf_experiment.py  S2: traffic generator + meter, runs the load sweep
 analyze.py          S2: charts and tables from runs.csv
 config.json         sites, links, services, S1 workload, S2 `perf` experiment, seed
 docs/assignment1/M1.md           Milestone 1 design document and Week 1 failure log
 docs/assignment1/M2.md        Milestone 2 report and Week 2 failure log
-experiments/m3_run.py           S3: traffic runs (S2 or S3, local or Docker) and control-plane benchmark
+m3_run.py           S3: traffic runs (S2 or S3, local or Docker) and control-plane benchmark
 experiments/docker_sweep.py     S3: runs experiments on Docker Compose (fresh stack per run)
-analysis/analyze_m3.py       S3: charts and tables for Milestone 3
-scripts/run_m3_all.sh       S3: every Milestone 3 experiment in order
+analyze_m3.py       S3: charts and tables for Milestone 3
+run_m3_all.sh       S3: every Milestone 3 experiment in order
 Dockerfile          S3: one image for every service
 docs/assignment2/M3.md        Milestone 3 report and Week 3 failure log
+experiments/m4_run.py           S4: coordination experiments E1-E5 (+ fake sites, smoke demo)
+analysis/analyze_m4.py       S4: charts and tables for Milestone 4
+scripts/run_m4_all.sh       S4: every Milestone 4 experiment in order
+docs/assignment2/M4.md        Milestone 4 report and Week 4 failure log
+configs/config_m3.json      S3 configuration (frozen)
 ```
 
 ## Output files

@@ -25,7 +25,7 @@ from concurrent.futures import ProcessPoolExecutor
 from .monitor import ResourceMonitor
 from .naming import RegistryClient
 from .process import Instance, State, Task
-from .protocol import STATS, call, make_server_callback, mono, now
+from .protocol import STATS, call, make_server_callback, mono, now, log_event
 from .resources import Resources
 from .scheduler import StrideScheduler
 
@@ -87,7 +87,8 @@ class Site:
     async def _to_manager(self, msg):
         try:
             if self.reg:                                         # S3: find the orchestrator by name
-                return await self.reg.call_service("orchestrator", msg, timeout=3.0)
+                log_event("exit_send", sid=msg.get("sid"))
+                return await self.reg.call_service("orchestrator", msg, timeout=3.0, retry_s=10.0)
             return await call(*self.manager, msg, timeout=3.0)
         except Exception as exc:
             log.warning("manager unreachable (%s): %r", msg.get("type"), exc)
@@ -120,8 +121,9 @@ class Site:
             return await self.handle_task(msg)
         if t == "ALLOCATE":
             s = msg["instance"]
-            if s["sid"] in self.sched.instances:
-                return {"ok": False, "error": "duplicate sid"}
+            log_event("allocate_recv", sid=s["sid"])
+            if s["sid"] in self.sched.instances:            # S4: a retried ALLOCATE is harmless
+                return {"ok": True, "duplicate": True}
             inst = Instance(sid=s["sid"], service=s["service"], ingress=s["ingress"],
                             demand=Resources.from_dict(s["demand"]), holding_s=float(s["holding_s"]),
                             work_kb=int(s.get("work_kb", self.work_kb)),
