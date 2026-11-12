@@ -200,14 +200,17 @@ def report(results, status, site_status, cfg):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default=os.path.join(ROOT, "configs/config.json"))
+    ap.add_argument("--config", default=os.path.join(ROOT, "config.json"))
     ap.add_argument("--policy")
     ap.add_argument("--rate", type=float, help="override arrival rate (requests/s)")
     ap.add_argument("--window", type=float, help="override arrival window (s)")
     ap.add_argument("--out")
     ap.add_argument("--no-launch", action="store_true")
+    ap.add_argument("--seed", type=int, help="override the random seed")
     a = ap.parse_args()
     cfg = json.load(open(a.config))
+    if a.seed is not None:
+        cfg["seed"] = a.seed
     if a.rate:
         cfg["workload"]["arrival_rate_per_s"] = a.rate
     if a.window:

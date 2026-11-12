@@ -10,9 +10,15 @@ A service request enters the network at an ingress site. If it is hosted at anot
 site, its bandwidth is also reserved on every link of the path ingress -> host.
 """
 import heapq
+import os
 from dataclasses import dataclass, asdict
 
 _EPS = 1e-9
+
+# S3 scalability fix. "single": one shortest-path search from the ingress gives the path to
+# every site (O(E log V) per admission). "per_site": the S1/S2 way, one search per candidate
+# site (O(V * E log V)), kept so the scalability benchmark can compare the two.
+PATH_MODE = os.environ.get("TELERM_PATH_MODE", "single")
 
 
 @dataclass(frozen=True)
@@ -113,6 +119,29 @@ class Topology:
             keys.append(link.key)
         return list(reversed(keys)), dist[dst]
 
+    def paths_from(self, src):
+        """One Dijkstra from src. Returns {node: (link_keys, latency_ms)} for every reachable node."""
+        dist, prev, heap = {src: 0.0}, {}, [(0.0, src)]
+        while heap:
+            d, u = heapq.heappop(heap)
+            if d > dist.get(u, float("inf")):
+                continue
+            for v, link in self.adj.get(u, []):
+                nd = d + link.latency_ms
+                if nd < dist.get(v, float("inf")):
+                    dist[v], prev[v] = nd, (u, link)
+                    heapq.heappush(heap, (nd, v))
+        out = {src: ([], 0.0)}
+        for node in dist:
+            if node == src:
+                continue
+            keys, n = [], node
+            while n != src:
+                n, link = prev[n]
+                keys.append(link.key)
+            out[node] = (list(reversed(keys)), dist[node])
+        return out
+
     def path_has_bw(self, keys, bw): return all(self.links[k].free + _EPS >= bw for k in keys)
 
     def reserve(self, keys, bw):
@@ -127,7 +156,11 @@ class Topology:
         return {k: round(l.allocated / l.capacity, 4) if l.capacity else 0.0 for k, l in self.links.items()}
 
 
-PLACEMENT_POLICIES = ("edge_first", "least_loaded", "best_fit")
+PLACEMENT_POLICIES = ("edge_first", "least_loaded", "best_fit", "tier_aware")
+
+# S3: how far a tier is from the users. tier_aware prefers the FARTHEST tier that still meets
+# the latency budget, so scarce edge capacity is kept for services that cannot go anywhere else.
+TIER_RANK = {"edge": 0, "core": 1, "cloud": 2}
 
 
 def evaluate_candidates(demand: Resources, ingress: str, max_latency_ms: float, nodes: dict, topo: Topology):
@@ -137,8 +170,9 @@ def evaluate_candidates(demand: Resources, ingress: str, max_latency_ms: float, 
     reasons counts why each rejected node failed ('latency', 'link_bw', 'node_capacity').
     """
     feasible, reasons = [], {}
+    paths = topo.paths_from(ingress) if PATH_MODE == "single" else None
     for nid, nr in sorted(nodes.items()):
-        keys, lat = topo.path(ingress, nid)
+        keys, lat = paths.get(nid, (None, float("inf"))) if paths is not None else topo.path(ingress, nid)
         if keys is None or lat > max_latency_ms + _EPS:
             reasons["latency"] = reasons.get("latency", 0) + 1
         elif not nr.can_allocate(demand):
@@ -150,9 +184,14 @@ def evaluate_candidates(demand: Resources, ingress: str, max_latency_ms: float, 
     return feasible, reasons
 
 
-def choose(feasible, demand, ingress, nodes, policy):
+def choose(feasible, demand, ingress, nodes, policy, tiers=None):
     if not feasible:
         return None
+    if policy == "tier_aware":      # farthest tier within the latency budget, then least loaded there
+        tiers = tiers or {}
+        return min(feasible, key=lambda f: (-TIER_RANK.get(tiers.get(f[0]), 0),
+                                            (nodes[f[0]].allocated + demand).dominant_share(nodes[f[0]].capacity),
+                                            f[2]))
     if policy == "edge_first":       # serve at the ingress site if possible, else lowest latency, then least loaded
         return min(feasible, key=lambda f: (f[0] != ingress, f[2],
                                             (nodes[f[0]].allocated + demand).dominant_share(nodes[f[0]].capacity)))

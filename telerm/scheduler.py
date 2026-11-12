@@ -33,6 +33,7 @@ class StrideScheduler:
         self.running = 0
         self.busy_s = 0.0
         self.dispatches = 0
+        self.expired = 0
         self._wake = asyncio.Event()
         self._stopped = False
 
@@ -87,6 +88,21 @@ class StrideScheduler:
         self._wake.set()
         return True
 
+    # ---- S3: deadline-aware dropping -----------------------------------------------------
+    def _purge_expired(self):
+        """Discard tasks that waited past their deadline BEFORE spending CPU on them.
+        Without this, an overloaded site keeps processing tasks whose clients already gave up,
+        and useful throughput collapses towards zero (seen in the first scale-out test)."""
+        t = mono()
+        for inst in self.instances.values():
+            while inst.queue and inst.queue[0].deadline_s and t - inst.queue[0].t_arrive > inst.queue[0].deadline_s:
+                task = inst.queue.popleft()
+                inst.tasks_expired += 1
+                self.expired += 1
+                if not task.future.done():
+                    task.future.set_result({"ok": False, "status": "EXPIRED",
+                                            "queue_ms": round((t - task.t_arrive) * 1000, 3)})
+
     # ---- dispatcher -------------------------------------------------------------------
     def _eligible(self):
         return [i for i in self.instances.values()
@@ -99,6 +115,7 @@ class StrideScheduler:
             for inst in list(self.instances.values()):          # holding time elapsed -> release
                 if inst.state == State.RUNNING and inst.expires_at <= t:
                     self.terminate(inst.sid)
+            self._purge_expired()
             while self.running < self.slots:
                 cands = self._eligible()
                 if not cands:
@@ -151,5 +168,5 @@ class StrideScheduler:
             counts[i.state.value] += 1
         return {"slots": self.slots, "running_jobs": self.running, "dispatches": self.dispatches,
                 "busy_s": round(self.busy_s, 3), "instances": counts,
-                "queued_tasks": sum(len(i.queue) for i in self.instances.values()),
+                "queued_tasks": sum(len(i.queue) for i in self.instances.values()), "expired": self.expired,
                 "allocated_tickets": sum(i.tickets for i in self.instances.values() if i.state == State.RUNNING)}

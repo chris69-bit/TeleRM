@@ -40,6 +40,7 @@ class Task:
     work_kb: int
     t_arrive: float               # site's monotonic clock
     future: object                # asyncio.Future resolved with the reply
+    deadline_s: float = 0.0       # S3: give up on the task if it waited longer than this (0 = never)
 
 
 @dataclass
@@ -63,6 +64,7 @@ class Instance:
     jobs_done: int = 0
     tasks_received: int = 0
     tasks_dropped: int = 0
+    tasks_expired: int = 0        # S3: discarded because they waited past their deadline
     busy_s: float = 0.0
     latency_sum_ms: float = 0.0
     last_jobs: int = 0            # for per-interval accounting

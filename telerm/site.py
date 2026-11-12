@@ -8,6 +8,9 @@ Responsibilities (local 'kernel'):
   * S2: accepts traffic TASKs for its instances, queues them, runs them on the workers and
     replies with how long each task waited and how long it took to process
   * S2: measures its real CPU and memory use (ResourceMonitor) and reports it in heartbeats
+  * S3 (--registry): registers with the registry instead of the manager, sends heartbeats to
+    the registry, pushes measurements to the telemetry service, and finds the orchestrator
+    by name. Only the registry's address is configured.
 
 Run:  python -m telerm.site --id edge-A --port 8101 --manager 127.0.0.1:8000 --cpu 4000 --mem 4096 --bw 2000 --slots 2
 """
@@ -20,6 +23,7 @@ import signal
 from concurrent.futures import ProcessPoolExecutor
 
 from .monitor import ResourceMonitor
+from .naming import RegistryClient
 from .process import Instance, State, Task
 from .protocol import STATS, call, make_server_callback, mono, now
 from .resources import Resources
@@ -54,6 +58,8 @@ class Site:
         self.id, self.host, self.port, self.bind = a.id, a.host, a.port, a.bind
         mh, mp = a.manager.rsplit(":", 1)
         self.manager = (mh, int(mp))
+        self.reg = RegistryClient(a.registry) if a.registry else None      # S3 mode
+        self.location = a.location or a.id
         self.capacity = Resources(a.cpu, a.mem, a.bw)
         self.tier = a.tier
         self.work_kb = a.work_kb
@@ -64,7 +70,8 @@ class Site:
         self.fairness_samples: list = []
         self.resource_samples: list = []
         self.monitor = None
-        self.counters = {"tasks_received": 0, "tasks_done": 0, "tasks_dropped": 0, "tasks_no_instance": 0}
+        self.counters = {"tasks_received": 0, "tasks_done": 0, "tasks_dropped": 0, "tasks_no_instance": 0,
+                         "tasks_expired": 0}
         self.shutdown = asyncio.Event()
         self.started = now()
 
@@ -79,6 +86,8 @@ class Site:
 
     async def _to_manager(self, msg):
         try:
+            if self.reg:                                         # S3: find the orchestrator by name
+                return await self.reg.call_service("orchestrator", msg, timeout=3.0)
             return await call(*self.manager, msg, timeout=3.0)
         except Exception as exc:
             log.warning("manager unreachable (%s): %r", msg.get("type"), exc)
@@ -93,13 +102,15 @@ class Site:
             return {"ok": False, "status": "NO_INSTANCE"}
         fut = asyncio.get_running_loop().create_future()
         task = Task(seq=int(msg.get("seq", 0)), work_kb=int(msg.get("work_kb", inst.work_kb)),
-                    t_arrive=mono(), future=fut)
+                    t_arrive=mono(), future=fut, deadline_s=float(msg.get("deadline_ms", 0)) / 1000)
         if not self.sched.enqueue(inst, task):
             self.counters["tasks_dropped"] += 1
             return {"ok": False, "status": "DROPPED"}         # queue full: packet loss
         reply = await fut
         if reply.get("ok"):
             self.counters["tasks_done"] += 1
+        elif reply.get("status") == "EXPIRED":
+            self.counters["tasks_expired"] += 1
         return reply
 
     # ---------------------------------------------------------------- control plane
@@ -173,11 +184,25 @@ class Site:
                         "queued": sum(len(i.queue) for i in self.sched.instances.values()),
                         **self.counters})
             self.resource_samples.append(res)
+            if self.reg:                     # S3: liveness -> registry, measurements -> telemetry
+                await self.reg.heartbeat()
+                try:
+                    await self.reg.call_service("telemetry", {
+                        "type": "REPORT", "node": self.id, "kind": "site", "ts": t,
+                        "sample": {**res, "fairness": fair, "msgs_sent": STATS["msgs_sent"],
+                                   "msgs_recv": STATS["msgs_recv"]}}, timeout=2.0)
+                except Exception:
+                    pass
+                continue
             await self._to_manager({"type": "HEARTBEAT", "site": self.id, "ts": t,
                                     "slot_utilisation": round(min(1.0, util), 3),
                                     "instances": per_inst, "fairness": fair, "resources": res})
 
     async def register(self):
+        if self.reg:
+            await self.reg.register(name=self.id, kind="site", host=self.host, port=self.port,
+                                    location=self.location, tier=self.tier, capacity=self.capacity.to_dict())
+            return
         msg = {"type": "REGISTER", "site": self.id, "host": self.host, "port": self.port, "tier": self.tier,
                "capacity": self.capacity.to_dict(), "pid": os.getpid()}
         for _ in range(50):
@@ -209,7 +234,7 @@ class Site:
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Telecom site node")
     ap.add_argument("--id", required=True)
-    ap.add_argument("--tier", default="edge", choices=["edge", "core"])
+    ap.add_argument("--tier", default="edge", choices=["edge", "core", "cloud"])
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--bind", default="127.0.0.1")
     ap.add_argument("--port", type=int, required=True)
@@ -220,6 +245,8 @@ def main(argv=None):
     ap.add_argument("--slots", type=int, default=2, help="worker OS processes")
     ap.add_argument("--work-kb", type=int, default=8192, help="size of one backlogged (S1) job")
     ap.add_argument("--heartbeat", type=float, default=1.0)
+    ap.add_argument("--registry", default=None, help="S3: registry address (replaces --manager)")
+    ap.add_argument("--location", default=None, help="S3: topology node of this site (default: --id)")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format=f"%(asctime)s [{a.id}] %(name)s: %(message)s")
     site = Site(a)

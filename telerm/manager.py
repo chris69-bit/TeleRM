@@ -1,4 +1,10 @@
-"""Global Resource Manager (the distributed-OS layer of TeleRM).
+"""Global Resource Manager / Orchestrator (the distributed-OS layer of TeleRM).
+
+S3: with --registry, this process becomes the *orchestrator* microservice. It no longer
+keeps the site list itself: before each admission it asks the registry which sites are
+alive (LIST_SITES), it publishes where each instance runs (ROUTE_SET) so gateways can find
+it, and it pushes its reservation snapshot to the telemetry service. Without --registry it
+behaves exactly as in S1/S2 (sites register and send heartbeats here).
 
 Responsibilities:
   * site registry + heartbeat failure detector
@@ -18,7 +24,8 @@ import os
 import signal
 
 from .monitor import ResourceMonitor
-from .protocol import STATS, call, make_server_callback, now
+from .naming import RegistryClient
+from .protocol import STATS, call, make_server_callback, mono, now
 from .resources import (PLACEMENT_POLICIES, NodeResources, Resources, Topology,
                         choose, evaluate_candidates)
 
@@ -48,6 +55,24 @@ class Manager:
         self.timeseries: list = []
         self.events: list = []
         self.alloc_log = open(os.path.join(self.out, "allocations.jsonl"), "a", buffering=1)
+        self.a = a
+        self.reg = RegistryClient(a.registry) if a.registry else None      # S3 mode
+        self.registry_ms: list = []
+
+    async def sync_sites(self):
+        """S3: refresh the site list from the registry (capacity, address, tier, liveness)."""
+        r = await self.reg.rpc({"type": "LIST_SITES"}, timeout=3.0)
+        for x in r.get("sites", []):
+            s = self.sites.get(x["name"])
+            if s is None:
+                s = self.sites[x["name"]] = {"res": NodeResources(Resources.from_dict(x["capacity"])),
+                                            "slot_utilisation": 0.0, "fairness": None, "last_hb": now()}
+                self.event("site_discovered", site=x["name"])
+            s.update({"host": x["host"], "port": x["port"], "tier": x["tier"], "pid": x["pid"],
+                      "status": x["status"]})
+
+    def tiers(self):
+        return {sid: s.get("tier") for sid, s in self.sites.items()}
 
     def event(self, kind, **kw):
         e = {"t": round(now() - self.started, 3), "event": kind, **kw}
@@ -71,10 +96,16 @@ class Manager:
             self.stats["requests"] += 1
             ps["offered"] += 1
             t0 = now()
+            reg_ms = None
+            if self.reg:
+                tr = mono()
+                await self.sync_sites()
+                reg_ms = (mono() - tr) * 1000
+                self.registry_ms.append(reg_ms)
             nodes = self.alive()
             feasible, reasons = evaluate_candidates(demand, r["ingress"], float(r.get("max_latency_ms", 1e9)),
                                                     nodes, self.topo)
-            pick = choose(feasible, demand, r["ingress"], nodes, self.policy)
+            pick = choose(feasible, demand, r["ingress"], nodes, self.policy, self.tiers())
             if pick is None:
                 reason = max(reasons, key=reasons.get) if reasons else "no_sites"
                 self.stats["blocked"] += 1
@@ -114,9 +145,14 @@ class Manager:
             ps["placed_on"][site_id] = ps["placed_on"].get(site_id, 0) + 1
             self.event("accepted", sid=sid, service=r["service"], ingress=r["ingress"], site=site_id,
                        path=path, latency_ms=lat)
+            if self.reg:                                     # S3: publish the route for the gateways
+                await self.reg.rpc({"type": "ROUTE_SET", "sid": sid, "site": site_id, "ingress": r["ingress"],
+                                    "address": f"{site['host']}:{site['port']}", "link_ms": lat}, timeout=3.0)
             return {"ok": True, "sid": sid, "status": "ACCEPTED", "site": site_id, "path": path,
+                    "tier": site.get("tier"),
                     "address": f"{site['host']}:{site['port']}",   # S2: where to send its traffic
-                    "latency_ms": lat, "decision_ms": round(decision_ms, 3)}
+                    "latency_ms": lat, "decision_ms": round(decision_ms, 3),
+                    "registry_ms": round(reg_ms, 3) if reg_ms is not None else None}
 
     async def resize(self, sid: str, new_cpu: float) -> dict:
         async with self.lock:
@@ -158,6 +194,14 @@ class Manager:
         self.topo.release(a["path"], a["demand"].bw)
         self.stats["released"] += 1
         self.event("released", sid=sid, site=a["site"])
+        if self.reg:
+            asyncio.create_task(self._route_del(sid))
+
+    async def _route_del(self, sid):
+        try:
+            await self.reg.rpc({"type": "ROUTE_DEL", "sid": sid}, timeout=3.0)
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ messages
     async def handle(self, msg):
@@ -200,6 +244,8 @@ class Manager:
 
     # ------------------------------------------------------------------ background loops
     async def failure_detector(self):
+        if self.reg:                      # S3: liveness is the registry's job
+            return
         while not self.shutdown.is_set():
             t = now()
             for sid, s in self.sites.items():
@@ -213,6 +259,26 @@ class Manager:
         monitor = ResourceMonitor()
         while not self.shutdown.is_set():
             await asyncio.sleep(1.0)
+            if self.reg:                  # S3: heartbeat to the registry, snapshot to telemetry
+                await self.reg.heartbeat()
+                sample = monitor.sample()
+                snap = {**sample, "active": sum(1 for a in self.alloc.values() if a["state"] == "ACTIVE"),
+                        "reservations": {sid: {k: round(v, 4) for k, v in s["res"].utilisation().items()}
+                                         for sid, s in self.sites.items()},
+                        "links": self.topo.utilisation(), "msgs_sent": STATS["msgs_sent"],
+                        "msgs_recv": STATS["msgs_recv"]}
+                try:
+                    await self.reg.call_service("telemetry", {"type": "REPORT", "node": "orchestrator",
+                                                              "kind": "service", "ts": now(), "sample": snap},
+                                                timeout=2.0)
+                except Exception:
+                    pass
+                self.timeseries.append({"t": round(now() - self.started, 2), "wall": round(now(), 3),
+                                        "active": snap["active"], "manager": sample,
+                                        "sites": {sid: {**snap["reservations"][sid], "slot_util": None,
+                                                        "measured": None} for sid in self.sites},
+                                        "links": snap["links"]})
+                continue
             self.timeseries.append({
                 "t": round(now() - self.started, 2), "wall": round(now(), 3),
                 "active": sum(1 for a in self.alloc.values() if a["state"] == "ACTIVE"),
@@ -223,7 +289,7 @@ class Manager:
                 "links": self.topo.utilisation()})
 
     def status(self, full=False):
-        sites = {sid: {"status": s["status"], "tier": s["tier"], "pid": s["pid"],
+        sites = {sid: {"status": s["status"], "tier": s.get("tier"), "pid": s.get("pid"),
                        "address": f"{s['host']}:{s['port']}",
                        "capacity": s["res"].capacity.to_dict(), "allocated": s["res"].allocated.to_dict(),
                        "utilisation": {k: round(v, 3) for k, v in s["res"].utilisation().items()},
@@ -231,6 +297,8 @@ class Manager:
                        "active": sum(1 for a in self.alloc.values() if a["site"] == sid and a["state"] == "ACTIVE")}
                  for sid, s in self.sites.items()}
         out = {"policy": self.policy, "uptime_s": round(now() - self.started, 2), "pid": os.getpid(),
+               "mode": "orchestrator (S3)" if self.reg else "manager (S1/S2)",
+               "registry_ms_mean": round(sum(self.registry_ms) / len(self.registry_ms), 3) if self.registry_ms else None,
                "stats": dict(self.stats), "per_service": self.per_service, "sites": sites,
                "links": {k: {"capacity_mbps": l.capacity, "allocated_mbps": l.allocated, "latency_ms": l.latency_ms}
                          for k, l in self.topo.links.items()},
@@ -244,7 +312,11 @@ class Manager:
 
     async def main(self):
         server = await asyncio.start_server(make_server_callback(self.handle), self.bind, self.port)
-        log.info("resource manager pid %d on %s:%d (placement=%s)", os.getpid(), self.bind, self.port, self.policy)
+        if self.reg:
+            await self.reg.register(name="orchestrator", kind="service", host=self.a.host, port=self.port,
+                                    location=self.a.location, tier="core")
+        log.info("%s pid %d on %s:%d (placement=%s)", "orchestrator" if self.reg else "resource manager",
+                 os.getpid(), self.bind, self.port, self.policy)
         loops = [asyncio.create_task(self.failure_detector()), asyncio.create_task(self.sampler())]
         await self.shutdown.wait()
         for l in loops:
@@ -261,6 +333,9 @@ def main(argv=None):
     ap.add_argument("--policy", default="edge_first", choices=PLACEMENT_POLICIES)
     ap.add_argument("--hb-timeout", type=float, default=3.0)
     ap.add_argument("--out", default="results/manual")
+    ap.add_argument("--registry", default=None, help="S3: registry address; turns this into the orchestrator")
+    ap.add_argument("--host", default="127.0.0.1", help="S3: address others use to reach this service")
+    ap.add_argument("--location", default="core-1", help="S3: site this service runs at")
     a = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [manager] %(name)s: %(message)s")
     m = Manager(a)
